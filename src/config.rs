@@ -1,0 +1,300 @@
+use std::collections::HashMap;
+use std::io::Write;
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+/// Top-level mixer configuration, stored at `~/.config/mixer/config.json`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Config {
+    /// Address the HTTP server binds to.
+    #[serde(default = "default_listen_addr")]
+    pub listen_addr: String,
+
+    /// Name of the default mixer model used when a request does not specify one,
+    /// or specifies a model name that isn't defined.
+    #[serde(default = "default_default_model")]
+    pub default_model: String,
+
+    /// Virtual mixer models, keyed by the name an OpenAI-compatible client
+    /// will pass in the `model` field.
+    #[serde(default)]
+    pub models: HashMap<String, MixerModel>,
+
+    /// Per-provider settings (authentication is stored separately under
+    /// `credentials/`; these are non-secret behavioural overrides).
+    #[serde(default)]
+    pub providers: HashMap<String, ProviderSettings>,
+}
+
+/// A virtual mixer model — a pool of concrete provider/model backends plus
+/// a routing strategy that picks one per request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MixerModel {
+    /// Human-readable description shown in `mixer models list`.
+    #[serde(default)]
+    pub description: String,
+
+    /// The pool of backends this mixer model may route to.
+    pub backends: Vec<Backend>,
+
+    /// Routing strategy used to pick one backend per request.
+    #[serde(default)]
+    pub strategy: RoutingStrategy,
+
+    /// Optional per-provider weights used when `strategy = "weighted"`.
+    /// Keyed by provider id. Providers absent from this map fall back to 1.0.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub weights: HashMap<String, f64>,
+}
+
+/// A single concrete backend: a provider plus one of that provider's models.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Backend {
+    /// Provider id (must match a registered provider, e.g. `codex`).
+    pub provider: String,
+
+    /// The provider-native model identifier (e.g. `gpt-5.2`, `glm-4.6`).
+    pub model: String,
+}
+
+/// How a mixer model picks a backend per request.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RoutingStrategy {
+    /// Uniformly random across all *available* backends (auth'd + capable
+    /// of handling the request).
+    #[default]
+    Random,
+
+    /// Weighted random using `weights`.
+    Weighted,
+
+    /// Weight each available backend by how *underused* its subscription is:
+    /// providers further from exhausting their monthly quota are preferred,
+    /// so consumption naturally evens out. Providers that don't report usage
+    /// fall back to equal weight.
+    UsageAware,
+}
+
+/// Non-secret, per-provider settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ProviderSettings {
+    /// When false, the provider is skipped even if authenticated.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Optional override for the provider's base URL (useful for self-hosted
+    /// endpoints or regional mirrors).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+
+    /// Caps the number of in-flight requests mixer will dispatch to this
+    /// provider concurrently. Requests beyond the cap queue inside the
+    /// mixer server; they are not rejected. Useful for self-hosted models
+    /// that can only service N requests at a time. `None` means unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_requests: Option<u32>,
+
+    /// Seconds before a request to this provider is aborted. `None` uses
+    /// the client default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_secs: Option<u64>,
+}
+
+fn default_listen_addr() -> String {
+    "127.0.0.1:4141".to_string()
+}
+
+fn default_default_model() -> String {
+    "mixer".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        let mut models = HashMap::new();
+        models.insert(
+            "mixer".to_string(),
+            MixerModel {
+                description: "Default pool — randomly routes to every authenticated subscription"
+                    .to_string(),
+                backends: vec![
+                    Backend {
+                        provider: "codex".to_string(),
+                        model: "gpt-5.2".to_string(),
+                    },
+                    Backend {
+                        provider: "minimax".to_string(),
+                        model: "MiniMax-M2".to_string(),
+                    },
+                    Backend {
+                        provider: "glm".to_string(),
+                        model: "glm-4.6".to_string(),
+                    },
+                    Backend {
+                        provider: "opencode".to_string(),
+                        model: "anthropic/claude-sonnet-4-6".to_string(),
+                    },
+                ],
+                strategy: RoutingStrategy::Random,
+                weights: HashMap::new(),
+            },
+        );
+
+        let mut providers = HashMap::new();
+        for id in ["codex", "minimax", "glm", "opencode"] {
+            providers.insert(id.to_string(), ProviderSettings::default_enabled());
+        }
+
+        Self {
+            listen_addr: default_listen_addr(),
+            default_model: default_default_model(),
+            models,
+            providers,
+        }
+    }
+}
+
+impl ProviderSettings {
+    pub fn default_enabled() -> Self {
+        Self {
+            enabled: true,
+            base_url: None,
+            max_concurrent_requests: None,
+            request_timeout_secs: None,
+        }
+    }
+}
+
+impl Config {
+    pub fn load(path: &Path) -> Result<Self> {
+        let contents =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        if contents.trim().is_empty() {
+            return Ok(Self::default());
+        }
+        let config: Config = serde_json::from_str(&contents)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        Ok(config)
+    }
+
+    pub fn load_or_default() -> Result<Self> {
+        let path = crate::paths::config_file()?;
+        if path.exists() {
+            Self::load(&path)
+        } else {
+            Ok(Self::default())
+        }
+    }
+
+    /// Atomic save — write to a temp file in the same directory, then rename.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let parent = path
+            .parent()
+            .context("config path has no parent directory")?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating directory {}", parent.display()))?;
+
+        let json = serde_json::to_string_pretty(self).context("serializing config")?;
+
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)
+            .with_context(|| format!("creating temp file in {}", parent.display()))?;
+        tmp.write_all(json.as_bytes())
+            .context("writing config to temp file")?;
+        tmp.flush().context("flushing config temp file")?;
+        tmp.persist(path)
+            .with_context(|| format!("persisting config to {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Resolve a mixer model name, falling back to `default_model` when the
+    /// caller-supplied name is empty or not defined.
+    pub fn resolve_model(&self, requested: &str) -> Option<(&str, &MixerModel)> {
+        if let Some((k, v)) = self.models.get_key_value(requested) {
+            return Some((k.as_str(), v));
+        }
+        self.models
+            .get_key_value(self.default_model.as_str())
+            .map(|(k, v)| (k.as_str(), v))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_includes_mixer_model() {
+        let c = Config::default();
+        assert!(c.models.contains_key("mixer"));
+        assert_eq!(c.default_model, "mixer");
+    }
+
+    #[test]
+    fn default_enables_four_builtin_providers() {
+        let c = Config::default();
+        assert!(c.providers.contains_key("codex"));
+        assert!(c.providers.contains_key("minimax"));
+        assert!(c.providers.contains_key("glm"));
+        assert!(c.providers.contains_key("opencode"));
+        for s in c.providers.values() {
+            assert!(s.enabled);
+            assert!(s.max_concurrent_requests.is_none());
+        }
+    }
+
+    #[test]
+    fn routing_strategy_default_is_random() {
+        assert_eq!(RoutingStrategy::default(), RoutingStrategy::Random);
+    }
+
+    #[test]
+    fn roundtrip_json() {
+        let c = Config::default();
+        let json = serde_json::to_string(&c).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(c, back);
+    }
+
+    #[test]
+    fn resolve_model_falls_back_to_default() {
+        let c = Config::default();
+        let (name, _) = c.resolve_model("nonexistent").unwrap();
+        assert_eq!(name, "mixer");
+    }
+
+    #[test]
+    fn resolve_model_returns_exact_match() {
+        let mut c = Config::default();
+        c.models.insert(
+            "vision".to_string(),
+            MixerModel {
+                description: String::new(),
+                backends: vec![Backend {
+                    provider: "codex".to_string(),
+                    model: "gpt-5.2".to_string(),
+                }],
+                strategy: RoutingStrategy::Random,
+                weights: HashMap::new(),
+            },
+        );
+        let (name, _) = c.resolve_model("vision").unwrap();
+        assert_eq!(name, "vision");
+    }
+
+    #[test]
+    fn parses_max_concurrent_requests() {
+        let raw = r#"{
+            "providers": {
+                "selfhost": { "enabled": true, "max_concurrent_requests": 2 }
+            }
+        }"#;
+        let c: Config = serde_json::from_str(raw).unwrap();
+        assert_eq!(c.providers["selfhost"].max_concurrent_requests, Some(2));
+    }
+}

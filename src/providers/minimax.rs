@@ -21,6 +21,7 @@ use crate::openai::ChatRequest;
 use crate::providers::common::api_key_login::prompt_and_store_api_key;
 use crate::providers::common::openai_client::{self, AuthScheme};
 use crate::providers::{AuthKind, ChatStream, ModelInfo, Provider};
+use crate::usage::UsageSnapshot;
 
 const DEFAULT_BASE_URL: &str = "https://api.minimax.chat/v1";
 const CHAT_PATH: &str = "/chat/completions";
@@ -65,6 +66,16 @@ impl Provider for MinimaxProvider {
     async fn login(&self, store: &CredentialStore) -> Result<()> {
         eprintln!("Generate a Minimax API key at https://platform.minimaxi.com/");
         prompt_and_store_api_key(store, self.id(), self.display_name())
+    }
+
+    /// Minimax exposes no public usage/quota endpoint — subscription
+    /// consumption is only visible inside the platform dashboard.
+    async fn usage(
+        &self,
+        _store: &CredentialStore,
+        _settings: &ProviderSettings,
+    ) -> Result<Option<UsageSnapshot>> {
+        Ok(None)
     }
 
     async fn chat_completion(
@@ -188,6 +199,18 @@ mod tests {
             Ok(_) => panic!("missing credentials should error"),
         };
         assert!(err.to_string().contains("not authenticated"));
+    }
+
+    #[tokio::test]
+    async fn usage_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let store = store_in(&tmp);
+        let settings = ProviderSettings::default_enabled();
+        let snap = MinimaxProvider.usage(&store, &settings).await.unwrap();
+        assert!(
+            snap.is_none(),
+            "minimax has no public usage endpoint — must return Ok(None)"
+        );
     }
 
     #[tokio::test]

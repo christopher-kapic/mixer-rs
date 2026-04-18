@@ -58,7 +58,9 @@ to see which providers are authenticated{}",
         RoutingStrategy::Weighted => weighted_pick(&candidates, |b| {
             *mixer_model.weights.get(&b.provider).unwrap_or(&1.0)
         })?,
-        RoutingStrategy::UsageAware => usage_aware_pick(registry, credentials, &candidates).await?,
+        RoutingStrategy::UsageAware => {
+            usage_aware_pick(config, registry, credentials, &candidates).await?
+        }
     };
 
     let chosen = &candidates[idx];
@@ -152,14 +154,20 @@ pub(crate) fn weighted_index(weights: &[f64]) -> Result<usize> {
 ///   - `fraction_used = None`    → weight = `0.5` (halfway, so providers with
 ///     no telemetry don't crowd out providers we *know* are underused).
 async fn usage_aware_pick(
+    config: &Config,
     registry: &ProviderRegistry,
     credentials: &CredentialStore,
     candidates: &[&Backend],
 ) -> Result<usize> {
     let mut weights = Vec::with_capacity(candidates.len());
     for b in candidates {
+        let settings = config
+            .providers
+            .get(&b.provider)
+            .cloned()
+            .unwrap_or_default();
         let w = match registry.get(&b.provider) {
-            Ok(p) => match p.usage(credentials).await {
+            Ok(p) => match p.usage(credentials, &settings).await {
                 Ok(Some(snap)) => match snap.fraction_used {
                     Some(f) => (1.0 - f).max(0.05),
                     None => 0.5,

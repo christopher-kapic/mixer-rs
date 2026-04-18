@@ -24,6 +24,7 @@ use crate::openai::ChatRequest;
 use crate::providers::common::api_key_login::prompt_and_store_api_key;
 use crate::providers::common::openai_client::{self, AuthScheme};
 use crate::providers::{AuthKind, ChatStream, ModelInfo, Provider};
+use crate::usage::UsageSnapshot;
 
 const DEFAULT_BASE_URL: &str = "https://opencode.ai/zen/v1";
 const CHAT_PATH: &str = "/chat/completions";
@@ -69,6 +70,17 @@ impl Provider for OpencodeProvider {
     async fn login(&self, store: &CredentialStore) -> Result<()> {
         eprintln!("Sign in at https://opencode.ai/auth to generate a Zen API key");
         prompt_and_store_api_key(store, self.id(), self.display_name())
+    }
+
+    /// The Zen gateway tracks usage server-side but offers no client-facing
+    /// quota endpoint (verified against opencode's own source — usage is only
+    /// surfaced via per-request response metadata).
+    async fn usage(
+        &self,
+        _store: &CredentialStore,
+        _settings: &ProviderSettings,
+    ) -> Result<Option<UsageSnapshot>> {
+        Ok(None)
     }
 
     async fn chat_completion(
@@ -171,6 +183,18 @@ mod tests {
             .downcast_ref::<AuthenticationError>()
             .expect("should be AuthenticationError");
         assert!(auth.message.contains("mixer auth login opencode"));
+    }
+
+    #[tokio::test]
+    async fn usage_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let store = store_in(&tmp);
+        let settings = ProviderSettings::default_enabled();
+        let snap = OpencodeProvider.usage(&store, &settings).await.unwrap();
+        assert!(
+            snap.is_none(),
+            "opencode Zen has no client-facing usage endpoint — must return Ok(None)"
+        );
     }
 
     #[tokio::test]

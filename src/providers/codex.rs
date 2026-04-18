@@ -38,6 +38,7 @@ use crate::providers::common::responses_api::{
     chat_request_to_responses_body, responses_sse_to_chat_chunks,
 };
 use crate::providers::{AuthKind, ChatStream, ModelInfo, Provider};
+use crate::usage::UsageSnapshot;
 
 /// OAuth client identifier published by the Codex CLI. Matches the value in
 /// `codex-rs/login/src/auth/manager.rs` and opencode's plugin/codex.ts.
@@ -51,6 +52,10 @@ const DEVICE_VERIFY_URL: &str = "https://auth.openai.com/codex/device";
 /// per-request via `ProviderSettings::base_url` (primarily for tests).
 const CHATGPT_BACKEND: &str = "https://chatgpt.com";
 const RESPONSES_PATH: &str = "/backend-api/codex/responses";
+/// ChatGPT rate-limit / plan-consumption endpoint (`codex-rs/backend-client`
+/// → `Client::get_rate_limits_many`). Returns `{ rate_limit: { primary_window,
+/// secondary_window }, plan_type, ... }`.
+const USAGE_PATH: &str = "/backend-api/wham/usage";
 
 pub struct CodexProvider;
 
@@ -100,6 +105,18 @@ impl Provider for CodexProvider {
             OauthFreshness::Valid | OauthFreshness::ExpiredRefreshable => true,
             OauthFreshness::ExpiredDead => false,
         }
+    }
+
+    async fn usage(
+        &self,
+        store: &CredentialStore,
+        settings: &ProviderSettings,
+    ) -> Result<Option<UsageSnapshot>> {
+        // Best-effort: a broken usage probe must not poison routing. Any
+        // failure — missing credentials, refresh denied, non-200, malformed
+        // body — degrades to `Ok(None)`, which the router treats as "unknown
+        // consumption, weight 0.5".
+        Ok(fetch_codex_usage(store, settings).await.ok().flatten())
     }
 
     async fn login(&self, store: &CredentialStore) -> Result<()> {
@@ -343,6 +360,87 @@ async fn refresh_codex_tokens_via_http(
         id_token: parsed.id_token,
         expires_in: parsed.expires_in,
     })
+}
+
+/// Fetch `/backend-api/wham/usage` and translate it to a [`UsageSnapshot`].
+/// Refreshes the access token first if it's near expiry; a refresh failure
+/// propagates so the caller can degrade to `Ok(None)`.
+async fn fetch_codex_usage(
+    store: &CredentialStore,
+    settings: &ProviderSettings,
+) -> Result<Option<UsageSnapshot>> {
+    let client = build_codex_http_client(settings)?;
+    let base = settings.base_url.as_deref().unwrap_or(CHATGPT_BACKEND);
+    let url = format!("{}{USAGE_PATH}", base.trim_end_matches('/'));
+    let issuer_base = auth_issuer(settings);
+    let now = Utc::now().timestamp();
+
+    let (access_token, account_id) =
+        ensure_fresh_codex_token(store, &client, &issuer_base, now).await?;
+
+    let resp = client
+        .get(&url)
+        .bearer_auth(&access_token)
+        .header("chatgpt-account-id", &account_id)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .context("requesting codex usage endpoint")?;
+
+    if !resp.status().is_success() {
+        // 401/403/5xx here are uninteresting to the router. Swallow.
+        return Ok(None);
+    }
+
+    let body: Value = resp.json().await.context("parsing codex usage response")?;
+    Ok(extract_codex_usage_snapshot(&body))
+}
+
+/// Translate the `/wham/usage` response into a [`UsageSnapshot`]. Prefers
+/// `secondary_window` (typically the weekly/monthly plan cap) over
+/// `primary_window` (short rate-limit window) since plan-consumption routing
+/// is the point of the `usage-aware` strategy. Returns `None` when neither
+/// window carries a `used_percent`.
+fn extract_codex_usage_snapshot(body: &Value) -> Option<UsageSnapshot> {
+    let rl = body.get("rate_limit")?;
+    let window = rl
+        .get("secondary_window")
+        .filter(|w| !w.is_null())
+        .or_else(|| rl.get("primary_window").filter(|w| !w.is_null()))?;
+
+    let used_percent = window.get("used_percent").and_then(Value::as_f64)?;
+    let window_secs = window
+        .get("limit_window_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    let plan_type = body
+        .get("plan_type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let label = format!(
+        "{:.1}% of {plan_type} plan used",
+        used_percent.clamp(0.0, 100.0)
+    );
+
+    Some(UsageSnapshot {
+        fraction_used: Some((used_percent / 100.0).clamp(0.0, 1.0)),
+        window: codex_window_name(window_secs),
+        label: Some(label),
+    })
+}
+
+fn codex_window_name(secs: u64) -> String {
+    const HOUR: u64 = 3600;
+    const DAY: u64 = 24 * HOUR;
+    match secs {
+        0 => "window".to_string(),
+        s if s < HOUR => "minutes".to_string(),
+        s if s < DAY => "hourly".to_string(),
+        s if s < 7 * DAY => "daily".to_string(),
+        s if s < 30 * DAY => "weekly".to_string(),
+        _ => "monthly".to_string(),
+    }
 }
 
 fn load_codex_blob(store: &CredentialStore) -> Result<Value> {
@@ -1443,6 +1541,287 @@ mod tests {
             assert!(auth_err.message.contains("mixer auth login codex"));
             assert_eq!(mock.refresh_calls.load(Ordering::SeqCst), 0);
             assert_eq!(mock.chat_calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    // ── usage() tests ───────────────────────────────────────────────────────
+
+    mod usage {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::{
+            Router, body::Body, extract::State, http::HeaderMap, response::Response, routing::get,
+        };
+
+        #[test]
+        fn extract_snapshot_prefers_secondary_window() {
+            let body = json!({
+                "plan_type": "pro",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 42,
+                        "limit_window_seconds": 3600,
+                    },
+                    "secondary_window": {
+                        "used_percent": 5.5,
+                        "limit_window_seconds": 7 * 86400,
+                    }
+                }
+            });
+            let snap = extract_codex_usage_snapshot(&body).expect("snapshot");
+            assert_eq!(snap.fraction_used, Some(0.055));
+            assert_eq!(snap.window, "weekly");
+            let label = snap.label.unwrap();
+            assert!(label.contains("pro"), "label mentions plan: {label}");
+            assert!(label.contains("5.5"), "label mentions percent: {label}");
+        }
+
+        #[test]
+        fn extract_snapshot_falls_back_to_primary_when_secondary_absent() {
+            let body = json!({
+                "plan_type": "plus",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 73,
+                        "limit_window_seconds": 3600,
+                    }
+                }
+            });
+            let snap = extract_codex_usage_snapshot(&body).expect("snapshot");
+            assert_eq!(snap.fraction_used, Some(0.73));
+            assert_eq!(snap.window, "hourly");
+        }
+
+        #[test]
+        fn extract_snapshot_falls_back_to_primary_when_secondary_null() {
+            let body = json!({
+                "plan_type": "plus",
+                "rate_limit": {
+                    "primary_window": { "used_percent": 20 },
+                    "secondary_window": null
+                }
+            });
+            let snap = extract_codex_usage_snapshot(&body).expect("snapshot");
+            assert_eq!(snap.fraction_used, Some(0.2));
+        }
+
+        #[test]
+        fn extract_snapshot_returns_none_without_rate_limit() {
+            assert!(extract_codex_usage_snapshot(&json!({ "plan_type": "pro" })).is_none());
+        }
+
+        #[test]
+        fn extract_snapshot_returns_none_without_used_percent() {
+            let body = json!({
+                "rate_limit": {
+                    "primary_window": { "limit_window_seconds": 3600 }
+                }
+            });
+            assert!(extract_codex_usage_snapshot(&body).is_none());
+        }
+
+        #[test]
+        fn extract_snapshot_clamps_out_of_range_percent() {
+            let body = json!({
+                "rate_limit": {
+                    "primary_window": { "used_percent": 150, "limit_window_seconds": 3600 }
+                }
+            });
+            let snap = extract_codex_usage_snapshot(&body).expect("snapshot");
+            assert_eq!(snap.fraction_used, Some(1.0));
+        }
+
+        #[test]
+        fn window_name_maps_seconds_to_label() {
+            assert_eq!(codex_window_name(0), "window");
+            assert_eq!(codex_window_name(60), "minutes");
+            assert_eq!(codex_window_name(3600), "hourly");
+            assert_eq!(codex_window_name(86_400), "daily");
+            assert_eq!(codex_window_name(7 * 86_400), "weekly");
+            assert_eq!(codex_window_name(60 * 86_400), "monthly");
+        }
+
+        // ── mocked /wham/usage ──────────────────────────────────────────────
+
+        struct UsageMock {
+            calls: AtomicUsize,
+            auth_tokens: StdMutex<Vec<String>>,
+            account_ids: StdMutex<Vec<String>>,
+            status: u16,
+            body: String,
+        }
+
+        use std::sync::Mutex as StdMutex;
+
+        async fn usage_handler(
+            State(state): State<Arc<UsageMock>>,
+            headers: HeaderMap,
+        ) -> Response {
+            state.calls.fetch_add(1, Ordering::SeqCst);
+            let auth = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let account = headers
+                .get("chatgpt-account-id")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            state.auth_tokens.lock().unwrap().push(auth);
+            state.account_ids.lock().unwrap().push(account);
+            Response::builder()
+                .status(state.status)
+                .header("Content-Type", "application/json")
+                .body(Body::from(state.body.clone()))
+                .unwrap()
+        }
+
+        async fn start_usage_mock(state: Arc<UsageMock>) -> SocketAddr {
+            let app = Router::new()
+                .route("/backend-api/wham/usage", get(usage_handler))
+                .with_state(state);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            addr
+        }
+
+        fn write_live_creds(store: &CredentialStore) {
+            let far = Utc::now().timestamp() + 100_000;
+            store
+                .save(
+                    "codex",
+                    &json!({
+                        "access_token": "live-access",
+                        "refresh_token": "stored-refresh",
+                        "chatgpt_account_id": "acc_test",
+                        "expires_at": far,
+                    }),
+                )
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn usage_returns_snapshot_with_bearer_and_account_headers() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = CredentialStore::with_dir_for_tests(tmp.path().to_path_buf());
+            write_live_creds(&store);
+
+            let mock = Arc::new(UsageMock {
+                calls: AtomicUsize::new(0),
+                auth_tokens: StdMutex::new(Vec::new()),
+                account_ids: StdMutex::new(Vec::new()),
+                status: 200,
+                body: json!({
+                    "plan_type": "pro",
+                    "rate_limit": {
+                        "primary_window": {
+                            "used_percent": 10,
+                            "limit_window_seconds": 18_000
+                        },
+                        "secondary_window": {
+                            "used_percent": 25,
+                            "limit_window_seconds": 7 * 86_400
+                        }
+                    }
+                })
+                .to_string(),
+            });
+            let addr = start_usage_mock(Arc::clone(&mock)).await;
+            let settings = ProviderSettings {
+                base_url: Some(format!("http://{addr}")),
+                ..ProviderSettings::default_enabled()
+            };
+
+            let snap = CodexProvider
+                .usage(&store, &settings)
+                .await
+                .expect("usage call succeeds")
+                .expect("snapshot present");
+
+            assert_eq!(snap.fraction_used, Some(0.25));
+            assert_eq!(snap.window, "weekly");
+            assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                mock.auth_tokens.lock().unwrap()[0],
+                "Bearer live-access",
+                "usage probe must forward the access token"
+            );
+            assert_eq!(
+                mock.account_ids.lock().unwrap()[0],
+                "acc_test",
+                "usage probe must forward the account id"
+            );
+        }
+
+        #[tokio::test]
+        async fn usage_returns_none_on_upstream_error() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = CredentialStore::with_dir_for_tests(tmp.path().to_path_buf());
+            write_live_creds(&store);
+
+            let mock = Arc::new(UsageMock {
+                calls: AtomicUsize::new(0),
+                auth_tokens: StdMutex::new(Vec::new()),
+                account_ids: StdMutex::new(Vec::new()),
+                status: 500,
+                body: r#"{"error":"oops"}"#.to_string(),
+            });
+            let addr = start_usage_mock(Arc::clone(&mock)).await;
+            let settings = ProviderSettings {
+                base_url: Some(format!("http://{addr}")),
+                ..ProviderSettings::default_enabled()
+            };
+
+            let snap = CodexProvider
+                .usage(&store, &settings)
+                .await
+                .expect("usage call succeeds");
+            assert!(snap.is_none(), "5xx should degrade to Ok(None)");
+            assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn usage_returns_none_when_credentials_missing() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = CredentialStore::with_dir_for_tests(tmp.path().to_path_buf());
+            // no credentials written
+            let settings = ProviderSettings::default_enabled();
+            let snap = CodexProvider
+                .usage(&store, &settings)
+                .await
+                .expect("usage call succeeds");
+            assert!(snap.is_none());
+        }
+
+        #[tokio::test]
+        async fn usage_returns_none_when_body_unparseable() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = CredentialStore::with_dir_for_tests(tmp.path().to_path_buf());
+            write_live_creds(&store);
+
+            let mock = Arc::new(UsageMock {
+                calls: AtomicUsize::new(0),
+                auth_tokens: StdMutex::new(Vec::new()),
+                account_ids: StdMutex::new(Vec::new()),
+                status: 200,
+                body: "not-json".to_string(),
+            });
+            let addr = start_usage_mock(Arc::clone(&mock)).await;
+            let settings = ProviderSettings {
+                base_url: Some(format!("http://{addr}")),
+                ..ProviderSettings::default_enabled()
+            };
+
+            let snap = CodexProvider
+                .usage(&store, &settings)
+                .await
+                .expect("usage call succeeds");
+            assert!(snap.is_none(), "malformed body should degrade to Ok(None)");
         }
     }
 }

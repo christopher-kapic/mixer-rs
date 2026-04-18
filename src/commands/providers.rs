@@ -78,8 +78,8 @@ async fn show(name: &str, as_json: bool) -> Result<()> {
     let config = Config::load_or_default()?;
     let p = registry.get(name)?;
 
-    let usage = p.usage(&credentials).await.unwrap_or(None);
     let settings = config.providers.get(name).cloned().unwrap_or_default();
+    let usage = p.usage(&credentials, &settings).await.unwrap_or(None);
 
     let payload = json!({
         "id": p.id(),
@@ -97,5 +97,22 @@ async fn show(name: &str, as_json: bool) -> Result<()> {
     // Pretty JSON is the canonical human-readable format for `show`.
     let _ = as_json;
     println!("{}", serde_json::to_string_pretty(&payload)?);
+    if let Some(snap) = &usage {
+        println!();
+        println!("{}", format_usage_line(snap));
+    }
     Ok(())
+}
+
+/// Human-friendly one-liner for a [`UsageSnapshot`], shown alongside the JSON
+/// payload. Intentionally concise — the JSON already carries the full shape.
+fn format_usage_line(snap: &crate::usage::UsageSnapshot) -> String {
+    let pct = snap
+        .fraction_used
+        .map(|f| format!("{:.1}%", (f * 100.0).clamp(0.0, 100.0)))
+        .unwrap_or_else(|| "unknown".to_string());
+    match &snap.label {
+        Some(label) => format!("usage: {pct} ({} — {})", snap.window, label),
+        None => format!("usage: {pct} ({})", snap.window),
+    }
 }

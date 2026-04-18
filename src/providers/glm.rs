@@ -21,6 +21,7 @@ use crate::openai::ChatRequest;
 use crate::providers::common::api_key_login::prompt_and_store_api_key;
 use crate::providers::common::openai_client::{self, AuthScheme};
 use crate::providers::{AuthKind, ChatStream, ModelInfo, Provider};
+use crate::usage::UsageSnapshot;
 
 const DEFAULT_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
 const CHAT_PATH: &str = "/chat/completions";
@@ -65,6 +66,16 @@ impl Provider for GlmProvider {
     async fn login(&self, store: &CredentialStore) -> Result<()> {
         eprintln!("Generate a z.ai API key at https://z.ai/manage-apikey/apikey-list");
         prompt_and_store_api_key(store, self.id(), self.display_name())
+    }
+
+    /// z.ai exposes no public per-key usage/quota endpoint — consumption is
+    /// only visible inside the platform dashboard.
+    async fn usage(
+        &self,
+        _store: &CredentialStore,
+        _settings: &ProviderSettings,
+    ) -> Result<Option<UsageSnapshot>> {
+        Ok(None)
     }
 
     async fn chat_completion(
@@ -159,6 +170,18 @@ mod tests {
             .downcast_ref::<AuthenticationError>()
             .expect("should be AuthenticationError");
         assert!(auth.message.contains("mixer auth login glm"));
+    }
+
+    #[tokio::test]
+    async fn usage_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let store = store_in(&tmp);
+        let settings = ProviderSettings::default_enabled();
+        let snap = GlmProvider.usage(&store, &settings).await.unwrap();
+        assert!(
+            snap.is_none(),
+            "glm has no public usage endpoint — must return Ok(None)"
+        );
     }
 
     #[tokio::test]

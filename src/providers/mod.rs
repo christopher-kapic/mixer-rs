@@ -88,7 +88,16 @@ pub trait Provider: Send + Sync {
 
     /// Best-effort snapshot of current subscription consumption. `None` means
     /// the provider does not (yet) expose this.
-    async fn usage(&self, _store: &CredentialStore) -> Result<Option<UsageSnapshot>> {
+    ///
+    /// Called lazily by the usage-aware router on each pick (no background
+    /// polling, no caching). Transient endpoint failures should degrade to
+    /// `Ok(None)` rather than propagate, so a broken telemetry endpoint
+    /// doesn't cascade into a routing failure.
+    async fn usage(
+        &self,
+        _store: &CredentialStore,
+        _settings: &ProviderSettings,
+    ) -> Result<Option<UsageSnapshot>> {
         Ok(None)
     }
 

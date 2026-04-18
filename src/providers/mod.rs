@@ -7,6 +7,7 @@
 //! caps, image-capability filtering — is handled generically.
 
 pub mod codex;
+pub mod common;
 pub mod glm;
 pub mod minimax;
 pub mod opencode;

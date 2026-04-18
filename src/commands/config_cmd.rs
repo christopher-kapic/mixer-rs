@@ -51,6 +51,7 @@ fn edit() -> Result<()> {
 ///   - `providers.<id>.max_concurrent_requests` (integer)
 ///   - `providers.<id>.base_url` (string)
 ///   - `providers.<id>.request_timeout_secs` (integer)
+///   - `providers.<id>.api_key_env` (string — name of the env var, not the key)
 fn set(key: &str, value: &str) -> Result<()> {
     let path = paths::config_file()?;
     let mut config = if path.exists() {
@@ -85,6 +86,16 @@ fn set(key: &str, value: &str) -> Result<()> {
                 "request_timeout_secs" => {
                     entry.request_timeout_secs = parse_opt_u64(value)?;
                 }
+                "api_key_env" => {
+                    entry.api_key_env = if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    };
+                }
+                "api_key" => bail!(
+                    "refusing to store a literal API key in config; use `api_key_env` to name an environment variable, or `mixer auth login {provider_id}` to store it in credentials"
+                ),
                 other => bail!("unsupported provider field `{other}`"),
             }
         }

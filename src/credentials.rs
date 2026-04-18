@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+use crate::config::ProviderSettings;
 use crate::paths;
 
 pub struct CredentialStore {
@@ -80,6 +81,34 @@ impl CredentialStore {
         Ok(())
     }
 
+    /// Load a provider's stored credential blob from disk, ignoring any
+    /// environment-variable override. Returns `None` when the file is absent
+    /// or empty. This is the file-only counterpart to `load_api_key`, which
+    /// layers env precedence on top.
+    #[allow(dead_code)]
+    pub fn load_blob(&self, provider_id: &str) -> Result<Option<Value>> {
+        self.load(provider_id)
+    }
+
+    /// Resolve the API key for a provider, preferring the environment variable
+    /// named in `settings.api_key_env` when that variable is set and non-empty.
+    /// Otherwise falls back to the `api_key` string field of the stored
+    /// credential blob. Returns `None` when neither source yields a value.
+    #[allow(dead_code)]
+    pub fn load_api_key(&self, provider_id: &str, settings: &ProviderSettings) -> Option<String> {
+        if let Some(var) = settings.api_key_env.as_deref() {
+            if let Ok(val) = std::env::var(var) {
+                if !val.is_empty() {
+                    return Some(val);
+                }
+            }
+        }
+        let blob = self.load_blob(provider_id).ok().flatten()?;
+        blob.get("api_key")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
+
     /// Remove a provider's stored credentials. No-op if the file is absent.
     pub fn remove(&self, provider_id: &str) -> Result<()> {
         let path = self.file(provider_id);
@@ -87,5 +116,119 @@ impl CredentialStore {
             std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn with_dir(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    fn store() -> (TempDir, CredentialStore) {
+        let tmp = TempDir::new().unwrap();
+        let store = CredentialStore::with_dir(tmp.path().to_path_buf());
+        (tmp, store)
+    }
+
+    fn settings_with_env(var: Option<&str>) -> ProviderSettings {
+        ProviderSettings {
+            api_key_env: var.map(|s| s.to_string()),
+            ..ProviderSettings::default_enabled()
+        }
+    }
+
+    #[test]
+    fn load_api_key_prefers_env_over_file() {
+        let (_tmp, store) = store();
+        store
+            .save("minimax", &json!({ "api_key": "from-file" }))
+            .unwrap();
+
+        let var = "MIXER_TEST_ENV_FIRST_KEY";
+        // SAFETY: single-threaded test, scoped to a unique var name.
+        unsafe { std::env::set_var(var, "from-env") };
+        let key = store.load_api_key("minimax", &settings_with_env(Some(var)));
+        unsafe { std::env::remove_var(var) };
+
+        assert_eq!(key.as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    fn load_api_key_falls_back_to_file_when_env_unset() {
+        let (_tmp, store) = store();
+        store
+            .save("minimax", &json!({ "api_key": "from-file" }))
+            .unwrap();
+
+        let var = "MIXER_TEST_ENV_UNSET_KEY";
+        unsafe { std::env::remove_var(var) };
+        let key = store.load_api_key("minimax", &settings_with_env(Some(var)));
+
+        assert_eq!(key.as_deref(), Some("from-file"));
+    }
+
+    #[test]
+    fn load_api_key_treats_empty_env_as_unset() {
+        let (_tmp, store) = store();
+        store
+            .save("minimax", &json!({ "api_key": "from-file" }))
+            .unwrap();
+
+        let var = "MIXER_TEST_EMPTY_ENV_KEY";
+        unsafe { std::env::set_var(var, "") };
+        let key = store.load_api_key("minimax", &settings_with_env(Some(var)));
+        unsafe { std::env::remove_var(var) };
+
+        assert_eq!(key.as_deref(), Some("from-file"));
+    }
+
+    #[test]
+    fn load_api_key_returns_none_when_neither_source_set() {
+        let (_tmp, store) = store();
+
+        let var = "MIXER_TEST_NEITHER_KEY";
+        unsafe { std::env::remove_var(var) };
+        let key = store.load_api_key("minimax", &settings_with_env(Some(var)));
+
+        assert!(key.is_none());
+    }
+
+    #[test]
+    fn load_api_key_falls_back_to_file_when_no_env_configured() {
+        let (_tmp, store) = store();
+        store
+            .save("minimax", &json!({ "api_key": "from-file" }))
+            .unwrap();
+
+        let key = store.load_api_key("minimax", &settings_with_env(None));
+
+        assert_eq!(key.as_deref(), Some("from-file"));
+    }
+
+    #[test]
+    fn load_blob_returns_raw_file_ignoring_env() {
+        let (_tmp, store) = store();
+        store
+            .save("minimax", &json!({ "api_key": "from-file" }))
+            .unwrap();
+
+        let var = "MIXER_TEST_BLOB_IGNORE_ENV";
+        unsafe { std::env::set_var(var, "from-env") };
+        let blob = store.load_blob("minimax").unwrap().unwrap();
+        unsafe { std::env::remove_var(var) };
+
+        assert_eq!(blob["api_key"], "from-file");
+    }
+
+    #[test]
+    fn load_blob_returns_none_when_missing() {
+        let (_tmp, store) = store();
+        assert!(store.load_blob("nope").unwrap().is_none());
     }
 }

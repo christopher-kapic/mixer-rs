@@ -101,6 +101,12 @@ pub struct ProviderSettings {
     /// the client default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_timeout_secs: Option<u64>,
+
+    /// Name of an environment variable to read the provider's API key from.
+    /// When set and non-empty at request time, this takes precedence over any
+    /// stored credential file. Only meaningful for API-key providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
 }
 
 fn default_listen_addr() -> String {
@@ -167,6 +173,7 @@ impl ProviderSettings {
             base_url: None,
             max_concurrent_requests: None,
             request_timeout_secs: None,
+            api_key_env: None,
         }
     }
 }

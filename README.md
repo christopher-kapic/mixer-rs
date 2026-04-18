@@ -24,8 +24,9 @@ cargo install --path .
 
 ```bash
 mixer init                          # write ~/.config/mixer/config.json
-mixer login codex                   # + login minimax / glm / opencode
-mixer providers list                # check who's authenticated
+mixer auth login codex              # + login minimax / glm / opencode
+mixer auth status                   # check who's authenticated
+mixer providers list                # provider metadata + usage
 mixer serve                         # http://127.0.0.1:4141
 ```
 

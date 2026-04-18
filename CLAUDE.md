@@ -38,8 +38,7 @@ src/
     mod.rs              — Re-exports
     init.rs             — `mixer init`
     serve.rs            — `mixer serve`
-    login.rs            — `mixer login`
-    logout.rs           — `mixer logout`
+    auth_cmd.rs         — `mixer auth login|logout|status`
     providers.rs        — `mixer providers list|show`
     models.rs           — `mixer models list|show`
     config_cmd.rs       — `mixer config show|edit|set|path`

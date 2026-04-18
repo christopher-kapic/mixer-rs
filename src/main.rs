@@ -12,7 +12,7 @@ mod usage;
 
 use clap::Parser;
 
-use cli::{Cli, Command};
+use cli::{AuthCommand, Cli, Command};
 
 #[tokio::main]
 async fn main() {
@@ -23,8 +23,19 @@ async fn main() {
         Command::Serve { addr, port, model } => {
             commands::serve::run(addr, port, model).await.map(|()| 0)
         }
-        Command::Login { provider } => commands::login::run(&provider).await.map(|()| 0),
-        Command::Logout { provider } => commands::logout::run(&provider).await.map(|()| 0),
+        Command::Auth { command } => match command {
+            AuthCommand::Login { provider } => {
+                commands::auth_cmd::login(&provider).await.map(|()| 0)
+            }
+            AuthCommand::Logout { provider } => {
+                commands::auth_cmd::logout(&provider).await.map(|()| 0)
+            }
+            AuthCommand::Status { provider, json } => {
+                commands::auth_cmd::status(provider.as_deref(), json)
+                    .await
+                    .map(|()| 0)
+            }
+        },
         Command::Providers { command } => commands::providers::run(&command).await.map(|()| 0),
         Command::Models { command } => commands::models::run(&command).map(|()| 0),
         Command::Config { command } => commands::config_cmd::run(&command).map(|()| 0),

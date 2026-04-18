@@ -42,16 +42,10 @@ pub enum Command {
         model: Option<String>,
     },
 
-    /// Log in to a provider subscription
-    Login {
-        /// Provider id (e.g. `codex`, `minimax`, `glm`, `opencode`)
-        provider: String,
-    },
-
-    /// Log out of a provider subscription
-    Logout {
-        /// Provider id
-        provider: String,
+    /// Manage provider authentication (login, logout, status)
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
     },
 
     /// Inspect providers
@@ -76,6 +70,30 @@ pub enum Command {
     Completions {
         /// Shell to generate completions for
         shell: Shell,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AuthCommand {
+    /// Log in to a provider subscription
+    Login {
+        /// Provider id (e.g. `codex`, `minimax`, `glm`, `opencode`)
+        provider: String,
+    },
+
+    /// Log out of a provider subscription
+    Logout {
+        /// Provider id
+        provider: String,
+    },
+
+    /// Show auth status for one or all providers
+    Status {
+        /// Provider id (omit to show all)
+        provider: Option<String>,
+
+        #[arg(long)]
+        json: bool,
     },
 }
 

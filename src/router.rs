@@ -33,23 +33,59 @@ pub async fn pick(
     mixer_model: &MixerModel,
     requires_images: bool,
 ) -> Result<RouteDecision> {
-    let candidates = filter_candidates(
+    pick_excluding(
+        config,
+        registry,
+        credentials,
+        mixer_model,
+        requires_images,
+        &[],
+    )
+    .await
+}
+
+/// Like [`pick`], but rules out specific `(provider, model)` backends. Used by
+/// the failover path in the server: when the first attempt fails with a
+/// retryable error, we re-pick from the same mixer model's pool excluding the
+/// backend that just failed.
+pub async fn pick_excluding(
+    config: &Config,
+    registry: &ProviderRegistry,
+    credentials: &CredentialStore,
+    mixer_model: &MixerModel,
+    requires_images: bool,
+    excluded: &[Backend],
+) -> Result<RouteDecision> {
+    let mut candidates = filter_candidates(
         config,
         registry,
         credentials,
         &mixer_model.backends,
         requires_images,
     );
+    if !excluded.is_empty() {
+        candidates.retain(|b| {
+            !excluded
+                .iter()
+                .any(|e| e.provider == b.provider && e.model == b.model)
+        });
+    }
 
     if candidates.is_empty() {
-        bail!(
-            "no eligible backends for this request (try `mixer providers list` \
+        if excluded.is_empty() {
+            bail!(
+                "no eligible backends for this request (try `mixer providers list` \
 to see which providers are authenticated{}",
-            if requires_images {
-                "; the request has images so only vision-capable models qualify)"
-            } else {
-                ")"
-            }
+                if requires_images {
+                    "; the request has images so only vision-capable models qualify)"
+                } else {
+                    ")"
+                }
+            );
+        }
+        bail!(
+            "no eligible backends remain after excluding {} failed backend(s)",
+            excluded.len()
         );
     }
 

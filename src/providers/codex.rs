@@ -31,8 +31,8 @@ use crate::config::ProviderSettings;
 use crate::credentials::CredentialStore;
 use crate::openai::ChatRequest;
 use crate::providers::common::oauth_refresh::{
-    AuthenticationError, EXPIRY_THRESHOLD_SECS, OauthFreshness, is_near_expiry, oauth_freshness,
-    provider_refresh_lock,
+    AuthenticationError, EXPIRY_THRESHOLD_SECS, OauthFreshness, UpstreamHttpError, is_near_expiry,
+    oauth_freshness, provider_refresh_lock,
 };
 use crate::providers::common::responses_api::{
     chat_request_to_responses_body, responses_sse_to_chat_chunks,
@@ -176,7 +176,10 @@ impl Provider for CodexProvider {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             let snippet: String = body.chars().take(1024).collect();
-            bail!("codex responses API returned {status}: {snippet}");
+            return Err(anyhow::Error::new(UpstreamHttpError {
+                status: status.as_u16(),
+                body_snippet: snippet,
+            }));
         }
 
         let event_stream = resp

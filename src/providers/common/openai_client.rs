@@ -24,7 +24,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use async_stream::try_stream;
 use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt};
@@ -35,7 +35,7 @@ use crate::openai::{
     MessageContent,
 };
 use crate::providers::ChatStream;
-use crate::providers::common::oauth_refresh::AuthenticationError;
+use crate::providers::common::oauth_refresh::{AuthenticationError, UpstreamHttpError};
 
 /// How the API key is presented to the upstream.
 #[derive(Debug, Clone, Copy)]
@@ -97,7 +97,10 @@ pub async fn chat_completion(
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         let snippet: String = body.chars().take(1024).collect();
-        bail!("upstream returned {status}: {snippet}");
+        return Err(anyhow::Error::new(UpstreamHttpError {
+            status: status.as_u16(),
+            body_snippet: snippet,
+        }));
     }
 
     let content_type = resp

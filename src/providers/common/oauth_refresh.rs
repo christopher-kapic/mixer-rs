@@ -40,6 +40,28 @@ impl std::fmt::Display for AuthenticationError {
 
 impl std::error::Error for AuthenticationError {}
 
+/// Provider error wrapping a non-success HTTP response from an upstream. The
+/// server layer downcasts this in `is_retryable` to decide whether to retry
+/// on a different backend (per plan.md §5.2.1: 429 + 5xx are retryable;
+/// 4xx other than 429 are not).
+#[derive(Debug, Clone)]
+pub struct UpstreamHttpError {
+    pub status: u16,
+    pub body_snippet: String,
+}
+
+impl std::fmt::Display for UpstreamHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "upstream returned {}: {}",
+            self.status, self.body_snippet
+        )
+    }
+}
+
+impl std::error::Error for UpstreamHttpError {}
+
 /// Decode the `exp` claim from a JWT without verifying the signature. Returns
 /// `None` if the token is not a well-formed JWT or the claim is absent.
 pub fn decode_jwt_exp(token: &str) -> Option<i64> {

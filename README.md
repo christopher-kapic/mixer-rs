@@ -87,6 +87,20 @@ mixer config set providers.selfhost.max_concurrent_requests none   # clear
 
 The built-in `ollama` provider ships disabled with `max_concurrent_requests: 2` so GPU-constrained hosts can serialize requests out of the box. Enable it with `mixer config set providers.ollama.enabled true` once you have a local ollama server running; tune the cap to whatever your hardware can handle.
 
+## Securing the local endpoint
+
+By default mixer binds to `127.0.0.1` and accepts unauthenticated requests — fine for single-user laptops. If you bind to a non-loopback interface (e.g. `0.0.0.0:4141` for a home-LAN shared gateway, or exposing mixer over Tailscale), gate the endpoint with a shared-secret bearer token:
+
+```bash
+mixer config set listen_bearer_token_env MIXER_BEARER
+export MIXER_BEARER=$(openssl rand -hex 32)
+mixer serve
+```
+
+Only the *name* of the environment variable lives in `config.json`; the token itself never touches disk. When the env var resolves to a non-empty value, mixer requires `Authorization: Bearer <token>` on every `/v1/*` request (`/healthz` is always exempt so liveness probes keep working). Mismatches return a 401 with an OpenAI-style body. Mixer logs a startup warning if the bind address is non-loopback and no token is configured.
+
+Point your OpenAI-compatible client at mixer as usual; most SDKs expose an `api_key` / `auth_token` setting that maps to `Authorization: Bearer ...`.
+
 ## Adding a provider
 
 One file per provider under `src/providers/`. Drop in `src/providers/myprovider.rs`, implement the `Provider` trait (models, login, chat_completion, optional usage), then register it in `builtin_registry()` in `src/providers/mod.rs`. That's it — routing, auth storage, usage weighting, image filtering, and concurrency caps work automatically.

@@ -30,8 +30,9 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Request, State},
     http::StatusCode,
+    middleware::{self, Next},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -67,12 +68,13 @@ pub struct AppState {
 }
 
 pub async fn serve(state: AppState, listen_addr: &str) -> Result<()> {
-    let app = build_router(state);
+    let app = build_router(state.clone());
     let listener = TcpListener::bind(listen_addr)
         .await
         .with_context(|| format!("binding to {listen_addr}"))?;
     let actual = listener.local_addr()?;
     tracing::info!(addr = %actual, "mixer listening");
+    maybe_warn_unprotected_bind(&state.config, &actual);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -81,11 +83,105 @@ pub async fn serve(state: AppState, listen_addr: &str) -> Result<()> {
 }
 
 fn build_router(state: AppState) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
+    // The bearer-token gate only guards `/v1/*`; `/healthz` always answers so
+    // liveness probes keep working regardless of the auth posture.
+    let v1 = Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route_layer(middleware::from_fn_with_state(state.clone(), bearer_auth));
+
+    Router::new()
+        .route("/healthz", get(healthz))
+        .merge(v1)
         .with_state(state)
+}
+
+/// Log a warning at startup when the server is about to accept traffic on a
+/// non-loopback interface without a bearer-token gate configured. This is the
+/// one place mixer has "first contact" with the network posture the operator
+/// picked.
+fn maybe_warn_unprotected_bind(config: &Config, bound: &std::net::SocketAddr) {
+    if bound.ip().is_loopback() {
+        return;
+    }
+    if resolve_bearer_token(config).is_some() {
+        return;
+    }
+    tracing::warn!(
+        addr = %bound,
+        "mixer is bound to a non-loopback address without a bearer-token gate; \
+         set `listen_bearer_token_env` in config and export the named env var to require \
+         `Authorization: Bearer <token>` on every /v1/* request",
+    );
+}
+
+/// Resolve the configured bearer token from the environment, treating an unset
+/// or empty value as "gate disabled". Returning `Option<String>` (rather than
+/// referencing the env value) sidesteps borrowing the process env across await
+/// points.
+fn resolve_bearer_token(config: &Config) -> Option<String> {
+    let env_name = config.listen_bearer_token_env.as_deref()?;
+    let value = std::env::var(env_name).ok()?;
+    if value.is_empty() { None } else { Some(value) }
+}
+
+/// Outcome of checking a request's Authorization header against the configured
+/// expected bearer. Kept separate from the middleware wrapper so the logic can
+/// be unit-tested without touching the process environment or axum internals.
+#[derive(Debug, PartialEq, Eq)]
+enum BearerOutcome {
+    /// Auth is not configured — pass the request through.
+    Disabled,
+    /// Auth matches — pass the request through.
+    Allowed,
+    /// Auth missing or wrong — respond 401.
+    Denied,
+}
+
+fn verify_bearer(expected: Option<&str>, auth_header: Option<&str>) -> BearerOutcome {
+    let Some(expected) = expected else {
+        return BearerOutcome::Disabled;
+    };
+    let provided = auth_header
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+        BearerOutcome::Allowed
+    } else {
+        BearerOutcome::Denied
+    }
+}
+
+/// Constant-time byte comparison that does not short-circuit on length
+/// mismatch: both length and byte differences fold into the same accumulator,
+/// so run time depends only on `max(a.len(), b.len())`. Hand-rolled to avoid a
+/// `subtle` dep for a single comparison site.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let len = a.len().max(b.len());
+    // Fold the length difference into the accumulator as a single non-zero
+    // bit when lengths disagree. Using u32 avoids wrap on `usize -> u8` casts.
+    let mut diff: u32 = if a.len() == b.len() { 0 } else { 1 };
+    for i in 0..len {
+        let av = *a.get(i).unwrap_or(&0);
+        let bv = *b.get(i).unwrap_or(&0);
+        diff |= (av ^ bv) as u32;
+    }
+    diff == 0
+}
+
+async fn bearer_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let expected = resolve_bearer_token(&state.config);
+    let header = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    match verify_bearer(expected.as_deref(), header.as_deref()) {
+        BearerOutcome::Disabled | BearerOutcome::Allowed => next.run(req).await,
+        BearerOutcome::Denied => {
+            AppError::unauthorized("missing or invalid bearer token").into_response()
+        }
+    }
 }
 
 async fn shutdown_signal() {
@@ -458,6 +554,14 @@ impl AppError {
         Self {
             status: StatusCode::NOT_FOUND,
             kind: "mixer_not_found",
+            message: msg.into(),
+        }
+    }
+
+    fn unauthorized(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            kind: "authentication_error",
             message: msg.into(),
         }
     }
@@ -1238,6 +1342,299 @@ mod tests {
                 saw_any,
                 "expected at least one JSON log line, got:\n{output}",
             );
+        }
+    }
+
+    // ── Bearer-token gate on /v1/* ─────────────────────────────────────────
+
+    mod bearer {
+        use super::*;
+        use axum::body::Body;
+        use axum::http::{self, Request};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt;
+
+        // Hand out a unique env var name per test so parallel tests don't
+        // stomp on each other's process environment.
+        static ENV_SEQ: AtomicUsize = AtomicUsize::new(0);
+        fn unique_env_name() -> String {
+            let n = ENV_SEQ.fetch_add(1, Ordering::SeqCst);
+            format!("MIXER_TEST_BEARER_{n}")
+        }
+
+        fn state_with_bearer(env_name: Option<String>) -> AppState {
+            let mut state = test_state(sample_chunks());
+            let mut cfg: Config = (*state.config).clone();
+            cfg.listen_bearer_token_env = env_name;
+            state.config = Arc::new(cfg);
+            state
+        }
+
+        fn chat_body_json() -> String {
+            serde_json::to_string(&chat_request(false)).unwrap()
+        }
+
+        // ── Pure unit tests ─────────────────────────────────────────────────
+
+        #[test]
+        fn constant_time_eq_matches_equal_bytes() {
+            assert!(constant_time_eq(b"hello", b"hello"));
+            assert!(constant_time_eq(b"", b""));
+        }
+
+        #[test]
+        fn constant_time_eq_rejects_different_bytes_of_same_length() {
+            assert!(!constant_time_eq(b"hello", b"hellz"));
+        }
+
+        #[test]
+        fn constant_time_eq_rejects_different_lengths() {
+            assert!(!constant_time_eq(b"hello", b"helloworld"));
+            assert!(!constant_time_eq(b"", b"x"));
+        }
+
+        #[test]
+        fn verify_bearer_passes_when_gate_disabled() {
+            assert_eq!(verify_bearer(None, None), BearerOutcome::Disabled);
+            assert_eq!(
+                verify_bearer(None, Some("Bearer whatever")),
+                BearerOutcome::Disabled,
+            );
+        }
+
+        #[test]
+        fn verify_bearer_allows_matching_token() {
+            assert_eq!(
+                verify_bearer(Some("secret"), Some("Bearer secret")),
+                BearerOutcome::Allowed,
+            );
+        }
+
+        #[test]
+        fn verify_bearer_denies_wrong_token() {
+            assert_eq!(
+                verify_bearer(Some("secret"), Some("Bearer wrong")),
+                BearerOutcome::Denied,
+            );
+        }
+
+        #[test]
+        fn verify_bearer_denies_missing_header() {
+            assert_eq!(verify_bearer(Some("secret"), None), BearerOutcome::Denied,);
+        }
+
+        #[test]
+        fn verify_bearer_denies_non_bearer_scheme() {
+            assert_eq!(
+                verify_bearer(Some("secret"), Some("Basic secret")),
+                BearerOutcome::Denied,
+            );
+        }
+
+        // ── Router-level tests through the full middleware stack ───────────
+
+        async fn send(
+            state: AppState,
+            auth: Option<&str>,
+            uri: &str,
+            method: &str,
+        ) -> (StatusCode, Vec<u8>) {
+            let app = build_router(state);
+            let builder = Request::builder().method(method).uri(uri);
+            let builder = match auth {
+                Some(v) => builder.header(http::header::AUTHORIZATION, v),
+                None => builder,
+            };
+            let body = if method == "POST" {
+                Body::from(chat_body_json())
+            } else {
+                Body::empty()
+            };
+            let req = builder
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            let (parts, body) = resp.into_parts();
+            let bytes = to_bytes(body, usize::MAX).await.unwrap().to_vec();
+            (parts.status, bytes)
+        }
+
+        #[tokio::test]
+        async fn valid_bearer_token_returns_200() {
+            let name = unique_env_name();
+            // SAFETY: tests run in-process and share the env, but each test
+            // picks a unique var name (see ENV_SEQ) so parallel runs don't
+            // observe each other's writes.
+            unsafe {
+                std::env::set_var(&name, "s3cret");
+            }
+            let state = state_with_bearer(Some(name.clone()));
+            let (status, _body) =
+                send(state, Some("Bearer s3cret"), "/v1/chat/completions", "POST").await;
+            assert_eq!(status, StatusCode::OK);
+            unsafe {
+                std::env::remove_var(&name);
+            }
+        }
+
+        #[tokio::test]
+        async fn missing_authorization_header_returns_401_openai_body() {
+            let name = unique_env_name();
+            unsafe {
+                std::env::set_var(&name, "s3cret");
+            }
+            let state = state_with_bearer(Some(name.clone()));
+            let (status, body) = send(state, None, "/v1/chat/completions", "POST").await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["error"]["type"], "authentication_error");
+            assert_eq!(
+                parsed["error"]["message"],
+                "missing or invalid bearer token"
+            );
+            unsafe {
+                std::env::remove_var(&name);
+            }
+        }
+
+        #[tokio::test]
+        async fn wrong_bearer_token_returns_401() {
+            let name = unique_env_name();
+            unsafe {
+                std::env::set_var(&name, "s3cret");
+            }
+            let state = state_with_bearer(Some(name.clone()));
+            let (status, _body) =
+                send(state, Some("Bearer nope"), "/v1/chat/completions", "POST").await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            unsafe {
+                std::env::remove_var(&name);
+            }
+        }
+
+        #[tokio::test]
+        async fn env_var_unset_disables_the_gate() {
+            let name = unique_env_name();
+            // Name the env var in config but deliberately leave it unset — the
+            // middleware must pass through, matching today's unauthenticated
+            // default.
+            unsafe {
+                std::env::remove_var(&name);
+            }
+            let state = state_with_bearer(Some(name));
+            let (status, _body) = send(state, None, "/v1/chat/completions", "POST").await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn empty_env_var_disables_the_gate() {
+            // Treat an empty string as "not set" — mirrors api_key_env
+            // semantics so users can `unset MIXER_BEARER` or
+            // `MIXER_BEARER=` interchangeably.
+            let name = unique_env_name();
+            unsafe {
+                std::env::set_var(&name, "");
+            }
+            let state = state_with_bearer(Some(name.clone()));
+            let (status, _body) = send(state, None, "/v1/chat/completions", "POST").await;
+            assert_eq!(status, StatusCode::OK);
+            unsafe {
+                std::env::remove_var(&name);
+            }
+        }
+
+        #[tokio::test]
+        async fn config_unset_means_no_gate() {
+            let state = state_with_bearer(None);
+            let (status, _body) = send(state, None, "/v1/chat/completions", "POST").await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn healthz_bypasses_gate_when_enabled() {
+            let name = unique_env_name();
+            unsafe {
+                std::env::set_var(&name, "s3cret");
+            }
+            let state = state_with_bearer(Some(name.clone()));
+            let (status, body) = send(state, None, "/healthz", "GET").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, b"ok");
+            unsafe {
+                std::env::remove_var(&name);
+            }
+        }
+
+        #[tokio::test]
+        async fn healthz_bypasses_gate_when_disabled() {
+            let state = state_with_bearer(None);
+            let (status, body) = send(state, None, "/healthz", "GET").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, b"ok");
+        }
+
+        #[tokio::test]
+        async fn non_loopback_bind_without_token_logs_warning() {
+            use crate::logging::test_support::{CapturedWriter, text_subscriber};
+
+            let writer = CapturedWriter::new();
+            let sub = text_subscriber(writer.clone());
+            let bound: std::net::SocketAddr = "0.0.0.0:4141".parse().unwrap();
+            let mut cfg = Config::default();
+            cfg.listen_bearer_token_env = None;
+            tracing::subscriber::with_default(sub, || {
+                maybe_warn_unprotected_bind(&cfg, &bound);
+            });
+            let out = writer.contents();
+            assert!(
+                out.contains("non-loopback"),
+                "expected warning about non-loopback bind without a token, got:\n{out}",
+            );
+        }
+
+        #[tokio::test]
+        async fn loopback_bind_without_token_is_silent() {
+            use crate::logging::test_support::{CapturedWriter, text_subscriber};
+
+            let writer = CapturedWriter::new();
+            let sub = text_subscriber(writer.clone());
+            let bound: std::net::SocketAddr = "127.0.0.1:4141".parse().unwrap();
+            let cfg = Config::default();
+            tracing::subscriber::with_default(sub, || {
+                maybe_warn_unprotected_bind(&cfg, &bound);
+            });
+            let out = writer.contents();
+            assert!(
+                !out.contains("non-loopback"),
+                "loopback bind should not warn, got:\n{out}",
+            );
+        }
+
+        #[tokio::test]
+        async fn non_loopback_bind_with_token_is_silent() {
+            use crate::logging::test_support::{CapturedWriter, text_subscriber};
+
+            let name = unique_env_name();
+            unsafe {
+                std::env::set_var(&name, "s3cret");
+            }
+            let writer = CapturedWriter::new();
+            let sub = text_subscriber(writer.clone());
+            let bound: std::net::SocketAddr = "0.0.0.0:4141".parse().unwrap();
+            let mut cfg = Config::default();
+            cfg.listen_bearer_token_env = Some(name.clone());
+            tracing::subscriber::with_default(sub, || {
+                maybe_warn_unprotected_bind(&cfg, &bound);
+            });
+            let out = writer.contents();
+            assert!(
+                !out.contains("non-loopback"),
+                "non-loopback bind with a token should not warn, got:\n{out}",
+            );
+            unsafe {
+                std::env::remove_var(&name);
+            }
         }
     }
 }

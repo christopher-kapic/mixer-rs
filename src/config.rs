@@ -26,6 +26,16 @@ pub struct Config {
     /// `credentials/`; these are non-secret behavioural overrides).
     #[serde(default)]
     pub providers: HashMap<String, ProviderSettings>,
+
+    /// Name of an environment variable holding a shared-secret bearer token
+    /// that clients must present in `Authorization: Bearer <token>` on every
+    /// `/v1/*` request. Only the env var *name* is stored here — never the
+    /// token itself (same rationale as `api_key_env`, plan.md §3.6.2). When
+    /// unset, or when the env var resolves to an empty string, the local
+    /// endpoint accepts unauthenticated requests (preserves today's default
+    /// loopback-only behaviour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_bearer_token_env: Option<String>,
 }
 
 /// A virtual mixer model — a pool of concrete provider/model backends plus
@@ -173,6 +183,7 @@ impl Default for Config {
             default_model: default_default_model(),
             models,
             providers,
+            listen_bearer_token_env: None,
         }
     }
 }

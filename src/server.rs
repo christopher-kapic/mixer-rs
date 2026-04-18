@@ -25,6 +25,7 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -41,6 +42,7 @@ use futures::{StreamExt, stream};
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::OwnedSemaphorePermit;
+use tracing::Instrument;
 
 use crate::concurrency::ConcurrencyLimits;
 use crate::config::{Backend, Config, ProviderSettings};
@@ -70,7 +72,7 @@ pub async fn serve(state: AppState, listen_addr: &str) -> Result<()> {
         .await
         .with_context(|| format!("binding to {listen_addr}"))?;
     let actual = listener.local_addr()?;
-    eprintln!("mixer listening on http://{actual}");
+    tracing::info!(addr = %actual, "mixer listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -88,7 +90,7 @@ fn build_router(state: AppState) -> Router {
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
-    eprintln!("shutdown signal received, draining");
+    tracing::info!("shutdown signal received, draining");
 }
 
 async fn healthz() -> &'static str {
@@ -117,8 +119,48 @@ async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Response, AppError> {
+    let start = Instant::now();
     let wants_stream = req.stream.unwrap_or(false);
+    let requires_images = request_has_images(&req);
 
+    // Per-request span (plan.md §10): fields are declared up-front and filled
+    // in as routing decisions are made. The subscriber is configured with
+    // FmtSpan::CLOSE so one final log line fires when the span exits with
+    // every field populated.
+    let span = tracing::info_span!(
+        "chat_completion",
+        mixer_model = %req.model,
+        provider = tracing::field::Empty,
+        provider_model = tracing::field::Empty,
+        stream = wants_stream,
+        has_images = requires_images,
+        input_tokens = tracing::field::Empty,
+        output_tokens = tracing::field::Empty,
+        duration_ms = tracing::field::Empty,
+        status_code = tracing::field::Empty,
+    );
+
+    async move {
+        let result = dispatch_chat(state, req, wants_stream, requires_images).await;
+        let current = tracing::Span::current();
+        current.record("duration_ms", start.elapsed().as_millis() as u64);
+        let status = match &result {
+            Ok(resp) => resp.status().as_u16(),
+            Err(e) => e.status.as_u16(),
+        };
+        current.record("status_code", status);
+        result
+    }
+    .instrument(span)
+    .await
+}
+
+async fn dispatch_chat(
+    state: AppState,
+    req: ChatRequest,
+    wants_stream: bool,
+    requires_images: bool,
+) -> Result<Response, AppError> {
     if let Some(pinned) = &state.pinned_model
         && &req.model != pinned
     {
@@ -135,8 +177,6 @@ async fn chat_completions(
                 req.model
             ))
         })?;
-
-    let requires_images = request_has_images(&req);
 
     // Retry budget = 1 (plan.md §5.2.1). On a retryable failure before any
     // chunk reaches the client, we re-pick from the pool excluding the failed
@@ -178,9 +218,16 @@ async fn chat_completions(
             }
         };
 
-        eprintln!(
-            "[route] mixer_model={mixer_model_name} -> provider={} model={} (images={requires_images}, attempt={attempt})",
-            decision.provider_id, decision.provider_model
+        let span = tracing::Span::current();
+        span.record("provider", decision.provider_id.as_str());
+        span.record("provider_model", decision.provider_model.as_str());
+        tracing::info!(
+            mixer_model = %mixer_model_name,
+            provider = %decision.provider_id,
+            provider_model = %decision.provider_model,
+            attempt,
+            has_images = requires_images,
+            "route decision",
         );
 
         let provider = state
@@ -319,7 +366,13 @@ fn log_retry(provider_id: &str, err: &anyhow::Error, where_: &str) {
     } else {
         format!("{err:#}")
     };
-    eprintln!("[retry] {provider_id} failed at {where_} ({reason}); excluding and retrying");
+    tracing::info!(
+        retry = true,
+        from_provider = provider_id,
+        stage = where_,
+        reason = %reason,
+        "retrying on a different backend",
+    );
 }
 
 /// Convert a provider chunk stream into an SSE response. Each chunk becomes a
@@ -1077,6 +1130,113 @@ mod tests {
             assert!(
                 text.contains("[DONE]"),
                 "successful stream must close with [DONE]: {text}"
+            );
+        }
+    }
+
+    // ── Structured logging ─────────────────────────────────────────────────
+
+    mod logs {
+        use super::*;
+        use crate::logging::test_support::{CapturedWriter, json_subscriber};
+
+        /// Drive a single non-streaming request through `chat_completions` with
+        /// the JSON subscriber installed, and return the captured stderr
+        /// output. We use `with_default` + a current-thread tokio runtime so
+        /// the subscriber remains the default across await points.
+        fn run_with_json_subscriber<F>(f: F) -> String
+        where
+            F: FnOnce() + Send,
+        {
+            let writer = CapturedWriter::new();
+            let sub = json_subscriber(writer.clone());
+            tracing::subscriber::with_default(sub, f);
+            writer.contents()
+        }
+
+        #[test]
+        fn request_emits_close_event_with_routing_fields() {
+            let output = run_with_json_subscriber(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    let state = test_state(sample_chunks());
+                    let _ = chat_completions(State(state), Json(chat_request(false)))
+                        .await
+                        .expect("non-streaming request succeeds");
+                });
+            });
+
+            // The subscriber is configured with FmtSpan::CLOSE, which emits a
+            // synthetic event when the `chat_completion` span exits. That is
+            // the one line we guarantee carries every routing field.
+            // Span close events emit with the span's fields nested under
+            // `span` (per `tracing-subscriber`'s JSON format) and
+            // `message: "close"`. That's the one request-scoped line we
+            // guarantee carries every routing field.
+            let close_line = output
+                .lines()
+                .find(|l| {
+                    l.contains("\"message\":\"close\"")
+                        && l.contains("\"name\":\"chat_completion\"")
+                })
+                .unwrap_or_else(|| panic!("no chat_completion close event in log:\n{output}"));
+
+            let parsed: serde_json::Value = serde_json::from_str(close_line).unwrap();
+            let span = parsed
+                .get("span")
+                .and_then(|v| v.as_object())
+                .unwrap_or_else(|| panic!("span object missing: {close_line}"));
+
+            assert_eq!(
+                span.get("mixer_model").and_then(|v| v.as_str()),
+                Some("mixer"),
+            );
+            assert_eq!(span.get("provider").and_then(|v| v.as_str()), Some("stub"),);
+            assert_eq!(
+                span.get("provider_model").and_then(|v| v.as_str()),
+                Some("m"),
+            );
+            assert_eq!(span.get("stream").and_then(|v| v.as_bool()), Some(false));
+            assert_eq!(
+                span.get("has_images").and_then(|v| v.as_bool()),
+                Some(false),
+            );
+            assert_eq!(span.get("status_code").and_then(|v| v.as_u64()), Some(200),);
+            assert!(
+                span.get("duration_ms").and_then(|v| v.as_u64()).is_some(),
+                "duration_ms must be a number: {close_line}",
+            );
+        }
+
+        #[test]
+        fn every_emitted_json_line_is_parseable() {
+            // Ensures the JSON format never produces partial/malformed lines
+            // regardless of which code path fired (route decisions, span
+            // close, child events).
+            let output = run_with_json_subscriber(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    let state = test_state(sample_chunks());
+                    let _ = chat_completions(State(state), Json(chat_request(true)))
+                        .await
+                        .expect("streaming request succeeds");
+                });
+            });
+            let mut saw_any = false;
+            for line in output.lines().filter(|l| !l.is_empty()) {
+                let _: serde_json::Value = serde_json::from_str(line)
+                    .unwrap_or_else(|e| panic!("invalid JSON `{line}`: {e}"));
+                saw_any = true;
+            }
+            assert!(
+                saw_any,
+                "expected at least one JSON log line, got:\n{output}",
             );
         }
     }

@@ -139,7 +139,7 @@ impl Provider for CodexProvider {
         });
         store.save(self.id(), &blob)?;
 
-        eprintln!("codex: signed in (account {account_id})");
+        tracing::info!(provider = "codex", account_id = %account_id, "signed in");
         Ok(())
     }
 

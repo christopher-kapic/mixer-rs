@@ -4,6 +4,7 @@ mod commands;
 mod concurrency;
 mod config;
 mod credentials;
+mod logging;
 mod openai;
 mod paths;
 mod providers;
@@ -18,6 +19,7 @@ use cli::{AuthCommand, Cli, Command};
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    logging::init(cli.log_format);
 
     let result: anyhow::Result<i32> = match cli.command {
         Command::Init { non_interactive } => commands::init::run(non_interactive).map(|()| 0),

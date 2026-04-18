@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
 #[derive(Parser)]
@@ -14,8 +14,19 @@ agentic tools that hit the endpoint get the benefit of multi-model inference wit
 keys or quotas themselves."
 )]
 pub struct Cli {
+    /// Log output format (text = human-readable, json = one JSON object per line).
+    /// `RUST_LOG` controls the filter; default is `mixer=info`.
+    #[arg(long, value_enum, default_value_t = LogFormat::Text, global = true)]
+    pub log_format: LogFormat,
+
     #[command(subcommand)]
     pub command: Command,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogFormat {
+    Text,
+    Json,
 }
 
 #[derive(Subcommand)]

@@ -19,7 +19,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use chrono::Utc;
-use futures::stream;
+use eventsource_stream::Eventsource;
+use futures::StreamExt;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use reqwest::Client;
 use serde::Deserialize;
@@ -29,6 +30,9 @@ use tokio::time::sleep;
 use crate::config::ProviderSettings;
 use crate::credentials::CredentialStore;
 use crate::openai::ChatRequest;
+use crate::providers::common::responses_api::{
+    chat_request_to_responses_body, responses_sse_to_chat_chunks,
+};
 use crate::providers::{ChatStream, ModelInfo, Provider};
 
 /// OAuth client identifier published by the Codex CLI. Matches the value in
@@ -39,6 +43,10 @@ const ISSUER: &str = "https://auth.openai.com";
 /// usercode response (matches the `{base_url}/codex/device` value in
 /// `codex-rs/login/src/device_code_auth.rs`).
 const DEVICE_VERIFY_URL: &str = "https://auth.openai.com/codex/device";
+/// Default ChatGPT backend for `Provider::chat_completion`. Can be overridden
+/// per-request via `ProviderSettings::base_url` (primarily for tests).
+const CHATGPT_BACKEND: &str = "https://chatgpt.com";
+const RESPONSES_PATH: &str = "/backend-api/codex/responses";
 
 pub struct CodexProvider;
 
@@ -103,14 +111,73 @@ impl Provider for CodexProvider {
 
     async fn chat_completion(
         &self,
-        _store: &CredentialStore,
-        _settings: &ProviderSettings,
-        _req: ChatRequest,
+        store: &CredentialStore,
+        settings: &ProviderSettings,
+        req: ChatRequest,
     ) -> Result<ChatStream> {
-        Ok(Box::pin(stream::once(async {
-            Err(anyhow!("codex chat_completion not yet implemented"))
-        })))
+        let (access_token, account_id) = load_codex_auth(store, self.id())?;
+
+        let model = req.model.clone();
+        let body = chat_request_to_responses_body(&req, &model);
+
+        let base = settings.base_url.as_deref().unwrap_or(CHATGPT_BACKEND);
+        let url = format!("{}{RESPONSES_PATH}", base.trim_end_matches('/'));
+
+        let client = build_codex_http_client(settings)?;
+
+        let resp = client
+            .post(&url)
+            .bearer_auth(&access_token)
+            .header("chatgpt-account-id", &account_id)
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
+            .json(&body)
+            .send()
+            .await
+            .context("posting to codex responses endpoint")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let snippet: String = body.chars().take(1024).collect();
+            bail!("codex responses API returned {status}: {snippet}");
+        }
+
+        let event_stream = resp
+            .bytes_stream()
+            .eventsource()
+            .map(|r| r.map_err(|e| anyhow!("codex SSE stream error: {e}")));
+        let chunks = responses_sse_to_chat_chunks(event_stream);
+        Ok(Box::pin(chunks))
     }
+}
+
+fn load_codex_auth(store: &CredentialStore, provider_id: &str) -> Result<(String, String)> {
+    let blob = store
+        .load_blob(provider_id)
+        .with_context(|| "loading codex credentials")?
+        .ok_or_else(|| anyhow!("codex is not authenticated; run `mixer auth login codex`"))?;
+    let access_token = blob
+        .get("access_token")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("codex credentials are missing access_token"))?
+        .to_string();
+    let account_id = blob
+        .get("chatgpt_account_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("codex credentials are missing chatgpt_account_id"))?
+        .to_string();
+    Ok((access_token, account_id))
+}
+
+fn build_codex_http_client(settings: &ProviderSettings) -> Result<Client> {
+    let mut builder = Client::builder();
+    if let Some(secs) = settings.request_timeout_secs {
+        builder = builder.timeout(Duration::from_secs(secs));
+    }
+    builder.build().context("building reqwest client for codex")
 }
 
 #[derive(Debug, Deserialize)]
@@ -460,5 +527,252 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = CredentialStore::with_dir_for_tests(tmp.path().to_path_buf());
         assert!(!CodexProvider.is_authenticated(&store));
+    }
+
+    // ── chat_completion integration tests ───────────────────────────────────
+
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    use crate::openai::ChatRequest;
+
+    /// Spawn a minimal one-shot HTTP/1.1 server on 127.0.0.1:0. The server
+    /// reads a single request (up to end-of-headers), stashes the captured
+    /// `Authorization` and `chatgpt-account-id` headers for assertions, and
+    /// writes `response_body_after_headers` as the HTTP response body.
+    async fn spawn_mock_server(
+        status_line: &'static str,
+        content_type: &'static str,
+        body: String,
+        captured_auth: Arc<std::sync::Mutex<Option<String>>>,
+        captured_account: Arc<std::sync::Mutex<Option<String>>>,
+        started: oneshot::Sender<SocketAddr>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _ = started.send(addr);
+
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::with_capacity(8192);
+        let mut tmp = [0u8; 2048];
+        loop {
+            let n = socket.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let request = String::from_utf8_lossy(&buf).to_string();
+        for line in request.lines() {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            let name_l = name.trim().to_ascii_lowercase();
+            let value = value.trim().to_string();
+            match name_l.as_str() {
+                "authorization" => *captured_auth.lock().unwrap() = Some(value),
+                "chatgpt-account-id" => *captured_account.lock().unwrap() = Some(value),
+                _ => {}
+            }
+        }
+
+        let response = format!(
+            "{status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+        let _ = socket.shutdown().await;
+    }
+
+    fn write_creds(store: &CredentialStore) {
+        store
+            .save(
+                "codex",
+                &json!({
+                    "access_token": "test-access-token",
+                    "chatgpt_account_id": "acc_test",
+                }),
+            )
+            .unwrap();
+    }
+
+    fn chat_request_for(model: &str) -> ChatRequest {
+        serde_json::from_str(&format!(
+            r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}]}}"#
+        ))
+        .unwrap()
+    }
+
+    fn sse_body(payloads: &[&str]) -> String {
+        payloads.iter().map(|p| format!("data: {p}\n\n")).collect()
+    }
+
+    #[tokio::test]
+    async fn chat_completion_proxies_responses_sse_to_chunks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = CredentialStore::with_dir_for_tests(tmp.path().to_path_buf());
+        write_creds(&store);
+
+        let auth = Arc::new(std::sync::Mutex::new(None));
+        let account = Arc::new(std::sync::Mutex::new(None));
+        let body = sse_body(&[
+            r#"{"type":"response.created","response":{"id":"resp_mock","model":"gpt-5.2","created_at":100}}"#,
+            r#"{"type":"response.output_text.delta","delta":"Hello "}"#,
+            r#"{"type":"response.output_text.delta","delta":"from codex"}"#,
+            r#"{"type":"response.completed","response":{"id":"resp_mock","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+        ]);
+
+        let (tx, rx) = oneshot::channel();
+        let auth_c = Arc::clone(&auth);
+        let account_c = Arc::clone(&account);
+        let server = tokio::spawn(async move {
+            spawn_mock_server(
+                "HTTP/1.1 200 OK",
+                "text/event-stream",
+                body,
+                auth_c,
+                account_c,
+                tx,
+            )
+            .await;
+        });
+        let addr = rx.await.unwrap();
+
+        let settings = ProviderSettings {
+            base_url: Some(format!("http://{addr}")),
+            ..ProviderSettings::default_enabled()
+        };
+        let req = chat_request_for("gpt-5.2");
+
+        let stream = CodexProvider
+            .chat_completion(&store, &settings, req)
+            .await
+            .expect("chat_completion returns a stream");
+        let results: Vec<Result<_>> = stream.collect().await;
+        server.await.unwrap();
+
+        let chunks: Vec<_> = results
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .expect("no stream errors");
+
+        assert_eq!(
+            auth.lock().unwrap().as_deref(),
+            Some("Bearer test-access-token"),
+            "Authorization header should be forwarded"
+        );
+        assert_eq!(
+            account.lock().unwrap().as_deref(),
+            Some("acc_test"),
+            "chatgpt-account-id header should be forwarded"
+        );
+
+        let text: String = chunks
+            .iter()
+            .flat_map(|c| c.choices.iter().filter_map(|ch| ch.delta.content.clone()))
+            .collect();
+        assert_eq!(text, "Hello from codex");
+
+        let last = chunks.last().expect("at least one chunk");
+        assert_eq!(last.choices[0].finish_reason.as_deref(), Some("stop"));
+        let usage = last.usage.as_ref().expect("usage on final chunk");
+        assert_eq!(usage["input_tokens"], 1);
+        assert_eq!(usage["output_tokens"], 2);
+    }
+
+    #[tokio::test]
+    async fn chat_completion_surfaces_upstream_error_body() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = CredentialStore::with_dir_for_tests(tmp.path().to_path_buf());
+        write_creds(&store);
+
+        let auth = Arc::new(std::sync::Mutex::new(None));
+        let account = Arc::new(std::sync::Mutex::new(None));
+
+        let (tx, rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            spawn_mock_server(
+                "HTTP/1.1 401 Unauthorized",
+                "application/json",
+                r#"{"error":{"message":"token expired","type":"invalid_request_error"}}"#
+                    .to_string(),
+                auth,
+                account,
+                tx,
+            )
+            .await;
+        });
+        let addr = rx.await.unwrap();
+
+        let settings = ProviderSettings {
+            base_url: Some(format!("http://{addr}")),
+            ..ProviderSettings::default_enabled()
+        };
+
+        let result = CodexProvider
+            .chat_completion(&store, &settings, chat_request_for("gpt-5.2"))
+            .await;
+        server.await.unwrap();
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("401 should surface as an error, got Ok stream"),
+        };
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("401"), "error should include status: {msg}");
+        assert!(
+            msg.contains("token expired"),
+            "error should include body snippet: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completion_errors_when_credentials_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = CredentialStore::with_dir_for_tests(tmp.path().to_path_buf());
+        // no credentials written
+
+        let settings = ProviderSettings::default_enabled();
+        let result = CodexProvider
+            .chat_completion(&store, &settings, chat_request_for("gpt-5.2"))
+            .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("missing credentials should error"),
+        };
+        assert!(
+            err.to_string().contains("not authenticated"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completion_errors_when_account_id_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = CredentialStore::with_dir_for_tests(tmp.path().to_path_buf());
+        store
+            .save("codex", &json!({ "access_token": "only-token" }))
+            .unwrap();
+
+        let settings = ProviderSettings::default_enabled();
+        let result = CodexProvider
+            .chat_completion(&store, &settings, chat_request_for("gpt-5.2"))
+            .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("missing account id should error"),
+        };
+        assert!(
+            err.to_string().contains("chatgpt_account_id"),
+            "unexpected error: {err:#}"
+        );
     }
 }

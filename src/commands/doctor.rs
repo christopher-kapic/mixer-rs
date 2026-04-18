@@ -521,6 +521,7 @@ mod tests {
             backends,
             strategy: RoutingStrategy::Random,
             weights: HashMap::new(),
+            sticky: None,
         }
     }
 

@@ -31,7 +31,7 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     extract::{Request, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
@@ -213,6 +213,7 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelListResponse> {
 
 async fn chat_completions(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<ChatRequest>,
 ) -> Result<Response, AppError> {
     let start = Instant::now();
@@ -237,7 +238,7 @@ async fn chat_completions(
     );
 
     async move {
-        let result = dispatch_chat(state, req, wants_stream, requires_images).await;
+        let result = dispatch_chat(state, req, headers, wants_stream, requires_images).await;
         let current = tracing::Span::current();
         current.record("duration_ms", start.elapsed().as_millis() as u64);
         let status = match &result {
@@ -254,6 +255,7 @@ async fn chat_completions(
 async fn dispatch_chat(
     state: AppState,
     req: ChatRequest,
+    headers: HeaderMap,
     wants_stream: bool,
     requires_images: bool,
 ) -> Result<Response, AppError> {
@@ -274,6 +276,11 @@ async fn dispatch_chat(
             ))
         })?;
 
+    // Sticky key is computed once per request — evaluating it after a retry
+    // would reuse the just-failed backend, which is exactly what
+    // `pick_excluding` is there to prevent.
+    let sticky_hash = router::compute_sticky_hash(mixer_model, &req, &headers);
+
     // Retry budget = 1 (plan.md §5.2.1). On a retryable failure before any
     // chunk reaches the client, we re-pick from the pool excluding the failed
     // backend. A second failure surfaces. A failure after a chunk has been
@@ -290,6 +297,7 @@ async fn dispatch_chat(
                 &state.credentials,
                 mixer_model,
                 requires_images,
+                sticky_hash,
             )
             .await
         } else {
@@ -300,6 +308,7 @@ async fn dispatch_chat(
                 mixer_model,
                 requires_images,
                 &excluded,
+                sticky_hash,
             )
             .await
         };
@@ -676,6 +685,7 @@ mod tests {
                 }],
                 strategy: RoutingStrategy::Random,
                 weights: Default::default(),
+                sticky: None,
             },
         );
 
@@ -760,7 +770,7 @@ mod tests {
     #[tokio::test]
     async fn non_streaming_returns_accumulated_json() {
         let state = test_state(sample_chunks());
-        let resp = chat_completions(State(state), Json(chat_request(false)))
+        let resp = chat_completions(State(state), HeaderMap::new(), Json(chat_request(false)))
             .await
             .unwrap();
         let (parts, body) = resp.into_parts();
@@ -780,7 +790,7 @@ mod tests {
     #[tokio::test]
     async fn streaming_returns_sse_with_done_marker() {
         let state = test_state(sample_chunks());
-        let resp = chat_completions(State(state), Json(chat_request(true)))
+        let resp = chat_completions(State(state), HeaderMap::new(), Json(chat_request(true)))
             .await
             .unwrap();
         let (parts, body) = resp.into_parts();
@@ -925,6 +935,7 @@ mod tests {
                         .collect(),
                     strategy: RoutingStrategy::Random,
                     weights: Default::default(),
+                    sticky: None,
                 },
             );
 
@@ -1032,9 +1043,13 @@ mod tests {
             // Run multiple iterations so we exercise both initial-pick
             // orderings under the random strategy.
             for _ in 0..16 {
-                let resp = chat_completions(State(state.clone()), Json(chat_request(false)))
-                    .await
-                    .expect("retry should produce success");
+                let resp = chat_completions(
+                    State(state.clone()),
+                    HeaderMap::new(),
+                    Json(chat_request(false)),
+                )
+                .await
+                .expect("retry should produce success");
                 let (parts, body) = resp.into_parts();
                 assert_eq!(parts.status, StatusCode::OK);
                 let bytes = to_bytes(body, usize::MAX).await.unwrap();
@@ -1074,7 +1089,7 @@ mod tests {
                 vec![Behavior::OkChunks(vec![ok_chunk("ok", Some("stop"))])],
             );
             let state = pool_state(&[bad, good]);
-            let resp = chat_completions(State(state), Json(chat_request(false)))
+            let resp = chat_completions(State(state), HeaderMap::new(), Json(chat_request(false)))
                 .await
                 .expect("retry should succeed");
             let (parts, _) = resp.into_parts();
@@ -1097,8 +1112,12 @@ mod tests {
             // the request fails *without* falling through to `other`.
             let mut saw_only_failure = false;
             for _ in 0..32 {
-                let result =
-                    chat_completions(State(state.clone()), Json(chat_request(false))).await;
+                let result = chat_completions(
+                    State(state.clone()),
+                    HeaderMap::new(),
+                    Json(chat_request(false)),
+                )
+                .await;
                 match result {
                     Err(e) => {
                         assert_eq!(
@@ -1146,7 +1165,8 @@ mod tests {
             // so the original 503 surfaces to the client.
             let only = ScriptedProvider::new("only", vec![Behavior::DispatchErr(http_err(503))]);
             let state = pool_state(std::slice::from_ref(&only));
-            let result = chat_completions(State(state), Json(chat_request(false))).await;
+            let result =
+                chat_completions(State(state), HeaderMap::new(), Json(chat_request(false))).await;
             let err = result.expect_err("503 with no fallback should error");
             assert_eq!(err.status, StatusCode::BAD_GATEWAY);
             assert!(
@@ -1166,7 +1186,8 @@ mod tests {
             let a = ScriptedProvider::new("a", vec![Behavior::DispatchErr(http_err(503))]);
             let b = ScriptedProvider::new("b", vec![Behavior::DispatchErr(http_err(503))]);
             let state = pool_state(&[a.clone(), b.clone()]);
-            let result = chat_completions(State(state), Json(chat_request(false))).await;
+            let result =
+                chat_completions(State(state), HeaderMap::new(), Json(chat_request(false))).await;
             let err = result.expect_err("both backends failing should error");
             assert_eq!(err.status, StatusCode::BAD_GATEWAY);
             assert!(err.message.contains("503"));
@@ -1191,7 +1212,7 @@ mod tests {
                 )],
             );
             let state = pool_state(&[provider]);
-            let resp = chat_completions(State(state), Json(chat_request(true)))
+            let resp = chat_completions(State(state), HeaderMap::new(), Json(chat_request(true)))
                 .await
                 .expect("the headers and first frame succeed even if the stream then fails");
             let (parts, body) = resp.into_parts();
@@ -1220,7 +1241,7 @@ mod tests {
                 vec![Behavior::OkChunks(vec![ok_chunk("ok", Some("stop"))])],
             );
             let state = pool_state(&[bad, good]);
-            let resp = chat_completions(State(state), Json(chat_request(true)))
+            let resp = chat_completions(State(state), HeaderMap::new(), Json(chat_request(true)))
                 .await
                 .expect("retry should produce a streaming response");
             let (parts, body) = resp.into_parts();
@@ -1267,9 +1288,10 @@ mod tests {
                     .unwrap();
                 rt.block_on(async {
                     let state = test_state(sample_chunks());
-                    let _ = chat_completions(State(state), Json(chat_request(false)))
-                        .await
-                        .expect("non-streaming request succeeds");
+                    let _ =
+                        chat_completions(State(state), HeaderMap::new(), Json(chat_request(false)))
+                            .await
+                            .expect("non-streaming request succeeds");
                 });
             });
 
@@ -1327,9 +1349,10 @@ mod tests {
                     .unwrap();
                 rt.block_on(async {
                     let state = test_state(sample_chunks());
-                    let _ = chat_completions(State(state), Json(chat_request(true)))
-                        .await
-                        .expect("streaming request succeeds");
+                    let _ =
+                        chat_completions(State(state), HeaderMap::new(), Json(chat_request(true)))
+                            .await
+                            .expect("streaming request succeeds");
                 });
             });
             let mut saw_any = false;

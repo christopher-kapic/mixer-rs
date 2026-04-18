@@ -3,7 +3,8 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Top-level mixer configuration, stored at `~/.config/mixer/config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -57,6 +58,70 @@ pub struct MixerModel {
     /// Keyed by provider id. Providers absent from this map fall back to 1.0.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub weights: HashMap<String, f64>,
+
+    /// Optional sticky-session mode: pin a given conversation (or a
+    /// client-supplied session header) to a single backend via consistent
+    /// hashing over the eligible pool. Preserves KV-cache locality at the
+    /// cost of even distribution. Unset / `enabled: false` preserves today's
+    /// stateless per-request routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sticky: Option<StickyConfig>,
+}
+
+/// Sticky-session policy for a mixer model. See [`MixerModel::sticky`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StickyConfig {
+    /// When false, sticky routing is off and the model uses its normal
+    /// strategy.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// What to derive the sticky key from. See [`StickyKey`].
+    pub key: StickyKey,
+}
+
+/// How to compute a sticky-session key from the incoming request.
+///
+/// Serialised as a string to match the config shape documented in plan.md §10:
+///   * `"messages_hash"` — hash the conversation prefix (every message except
+///     the trailing run of user messages). Deterministic for a given input,
+///     which lets identical conversation snapshots route to the same backend.
+///   * `"header:<Name>"` — pull a named header from the request (e.g.
+///     `"header:X-Session-Id"`); absent or empty header falls through to the
+///     model's normal strategy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StickyKey {
+    MessagesHash,
+    Header(String),
+}
+
+impl Serialize for StickyKey {
+    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        match self {
+            StickyKey::MessagesHash => ser.serialize_str("messages_hash"),
+            StickyKey::Header(name) => ser.serialize_str(&format!("header:{name}")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StickyKey {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(de)?;
+        if raw == "messages_hash" {
+            return Ok(StickyKey::MessagesHash);
+        }
+        if let Some(name) = raw.strip_prefix("header:") {
+            if name.is_empty() {
+                return Err(D::Error::custom(
+                    "sticky key `header:` requires a header name after the colon",
+                ));
+            }
+            return Ok(StickyKey::Header(name.to_string()));
+        }
+        Err(D::Error::custom(format!(
+            "unknown sticky key `{raw}` (expected `messages_hash` or `header:<Name>`)"
+        )))
+    }
 }
 
 /// A single concrete backend: a provider plus one of that provider's models.
@@ -159,6 +224,7 @@ impl Default for Config {
                 ],
                 strategy: RoutingStrategy::Random,
                 weights: HashMap::new(),
+                sticky: None,
             },
         );
 
@@ -328,10 +394,45 @@ mod tests {
                 }],
                 strategy: RoutingStrategy::Random,
                 weights: HashMap::new(),
+                sticky: None,
             },
         );
         let (name, _) = c.resolve_model("vision").unwrap();
         assert_eq!(name, "vision");
+    }
+
+    #[test]
+    fn sticky_key_messages_hash_round_trips() {
+        let raw = r#""messages_hash""#;
+        let key: StickyKey = serde_json::from_str(raw).unwrap();
+        assert_eq!(key, StickyKey::MessagesHash);
+        assert_eq!(serde_json::to_string(&key).unwrap(), raw);
+    }
+
+    #[test]
+    fn sticky_key_header_round_trips() {
+        let raw = r#""header:X-Session-Id""#;
+        let key: StickyKey = serde_json::from_str(raw).unwrap();
+        assert_eq!(key, StickyKey::Header("X-Session-Id".to_string()));
+        assert_eq!(serde_json::to_string(&key).unwrap(), raw);
+    }
+
+    #[test]
+    fn sticky_key_rejects_unknown_and_empty_header_name() {
+        assert!(serde_json::from_str::<StickyKey>(r#""nope""#).is_err());
+        assert!(serde_json::from_str::<StickyKey>(r#""header:""#).is_err());
+    }
+
+    #[test]
+    fn mixer_model_parses_sticky_block() {
+        let raw = r#"{
+            "backends": [{"provider":"codex","model":"gpt-5.2"}],
+            "sticky": {"enabled": true, "key": "messages_hash"}
+        }"#;
+        let m: MixerModel = serde_json::from_str(raw).unwrap();
+        let s = m.sticky.expect("sticky should be present");
+        assert!(s.enabled);
+        assert_eq!(s.key, StickyKey::MessagesHash);
     }
 
     #[test]

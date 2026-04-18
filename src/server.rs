@@ -283,7 +283,7 @@ mod tests {
     use super::*;
     use crate::config::{Backend, MixerModel, RoutingStrategy};
     use crate::openai::{ChatCompletionChunk, ChatDelta, ChatMessage, ChunkChoice, MessageContent};
-    use crate::providers::{ChatStream, ModelInfo, Provider, ProviderRegistry};
+    use crate::providers::{AuthKind, ChatStream, ModelInfo, Provider, ProviderRegistry};
     use async_trait::async_trait;
     use axum::body::to_bytes;
     use axum::extract::State;
@@ -318,7 +318,10 @@ mod tests {
                 supports_images: false,
             }]
         }
-        fn is_authenticated(&self, _store: &CredentialStore) -> bool {
+        fn auth_kind(&self) -> AuthKind {
+            AuthKind::ApiKey
+        }
+        fn is_authenticated(&self, _store: &CredentialStore, _settings: &ProviderSettings) -> bool {
             true
         }
         async fn login(&self, _store: &CredentialStore) -> anyhow::Result<()> {

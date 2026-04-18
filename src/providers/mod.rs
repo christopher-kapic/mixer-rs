@@ -39,6 +39,17 @@ pub struct ModelInfo {
     pub supports_images: bool,
 }
 
+/// How a provider authenticates. Drives `mixer auth status` output and lets
+/// the CLI know whether `api_key_env` is applicable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthKind {
+    /// Static API key — may be sourced from `settings.api_key_env` or the
+    /// stored credentials file. See `CredentialStore::load_api_key`.
+    ApiKey,
+    /// OAuth device-authorization flow with refreshable access tokens.
+    DeviceFlow,
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync {
     /// Stable identifier used in config (`backends[].provider`) and on the
@@ -52,9 +63,17 @@ pub trait Provider: Send + Sync {
     /// of whether the user has enabled all of them in config.
     fn models(&self) -> Vec<ModelInfo>;
 
-    /// Whether the user has stored credentials that look usable. Providers
+    /// How this provider authenticates. Informs `mixer auth status` about
+    /// whether env-var sources and OAuth freshness details apply.
+    fn auth_kind(&self) -> AuthKind;
+
+    /// Whether the user has credentials that look currently usable. Providers
     /// should lean toward "yes" here — a real probe happens on dispatch.
-    fn is_authenticated(&self, store: &CredentialStore) -> bool {
+    ///
+    /// Default behavior inspects the stored file only, which is enough for
+    /// device-flow providers to override meaningfully and for API-key
+    /// providers to consult `settings.api_key_env`.
+    fn is_authenticated(&self, store: &CredentialStore, _settings: &ProviderSettings) -> bool {
         store.exists(self.id())
     }
 

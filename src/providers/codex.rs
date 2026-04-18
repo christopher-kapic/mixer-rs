@@ -31,12 +31,13 @@ use crate::config::ProviderSettings;
 use crate::credentials::CredentialStore;
 use crate::openai::ChatRequest;
 use crate::providers::common::oauth_refresh::{
-    AuthenticationError, EXPIRY_THRESHOLD_SECS, is_near_expiry, provider_refresh_lock,
+    AuthenticationError, EXPIRY_THRESHOLD_SECS, OauthFreshness, is_near_expiry, oauth_freshness,
+    provider_refresh_lock,
 };
 use crate::providers::common::responses_api::{
     chat_request_to_responses_body, responses_sse_to_chat_chunks,
 };
-use crate::providers::{ChatStream, ModelInfo, Provider};
+use crate::providers::{AuthKind, ChatStream, ModelInfo, Provider};
 
 /// OAuth client identifier published by the Codex CLI. Matches the value in
 /// `codex-rs/login/src/auth/manager.rs` and opencode's plugin/codex.ts.
@@ -78,13 +79,26 @@ impl Provider for CodexProvider {
         ]
     }
 
-    fn is_authenticated(&self, store: &CredentialStore) -> bool {
-        match store.load_blob(self.id()) {
-            Ok(Some(blob)) => blob
-                .get("access_token")
-                .and_then(Value::as_str)
-                .is_some_and(|s| !s.is_empty()),
-            _ => false,
+    fn auth_kind(&self) -> AuthKind {
+        AuthKind::DeviceFlow
+    }
+
+    fn is_authenticated(&self, store: &CredentialStore, _settings: &ProviderSettings) -> bool {
+        let Ok(Some(blob)) = store.load_blob(self.id()) else {
+            return false;
+        };
+        let has_access = blob
+            .get("access_token")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty());
+        if !has_access {
+            return false;
+        }
+        // A non-expired access_token is authenticated; an expired one is still
+        // authenticated when we can refresh it.
+        match oauth_freshness(&blob, Utc::now().timestamp()) {
+            OauthFreshness::Valid | OauthFreshness::ExpiredRefreshable => true,
+            OauthFreshness::ExpiredDead => false,
         }
     }
 
@@ -693,7 +707,8 @@ mod tests {
                 &json!({ "access_token": "at-live", "chatgpt_account_id": "acc" }),
             )
             .unwrap();
-        assert!(CodexProvider.is_authenticated(&store));
+        let settings = ProviderSettings::default_enabled();
+        assert!(CodexProvider.is_authenticated(&store, &settings));
     }
 
     #[test]
@@ -701,14 +716,55 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = CredentialStore::with_dir_for_tests(tmp.path().to_path_buf());
         store.save("codex", &json!({ "access_token": "" })).unwrap();
-        assert!(!CodexProvider.is_authenticated(&store));
+        let settings = ProviderSettings::default_enabled();
+        assert!(!CodexProvider.is_authenticated(&store, &settings));
     }
 
     #[test]
     fn is_authenticated_false_when_blob_missing() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = CredentialStore::with_dir_for_tests(tmp.path().to_path_buf());
-        assert!(!CodexProvider.is_authenticated(&store));
+        let settings = ProviderSettings::default_enabled();
+        assert!(!CodexProvider.is_authenticated(&store, &settings));
+    }
+
+    #[test]
+    fn is_authenticated_false_when_expired_and_no_refresh_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = CredentialStore::with_dir_for_tests(tmp.path().to_path_buf());
+        let past = Utc::now().timestamp() - 3_600;
+        store
+            .save(
+                "codex",
+                &json!({
+                    "access_token": "at-stale",
+                    "chatgpt_account_id": "acc",
+                    "expires_at": past,
+                }),
+            )
+            .unwrap();
+        let settings = ProviderSettings::default_enabled();
+        assert!(!CodexProvider.is_authenticated(&store, &settings));
+    }
+
+    #[test]
+    fn is_authenticated_true_when_expired_but_refresh_token_present() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = CredentialStore::with_dir_for_tests(tmp.path().to_path_buf());
+        let past = Utc::now().timestamp() - 3_600;
+        store
+            .save(
+                "codex",
+                &json!({
+                    "access_token": "at-stale",
+                    "refresh_token": "rt-live",
+                    "chatgpt_account_id": "acc",
+                    "expires_at": past,
+                }),
+            )
+            .unwrap();
+        let settings = ProviderSettings::default_enabled();
+        assert!(CodexProvider.is_authenticated(&store, &settings));
     }
 
     // ── chat_completion integration tests ───────────────────────────────────

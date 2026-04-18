@@ -92,6 +92,44 @@ pub fn is_near_expiry(blob: &Value, now: i64, threshold_secs: i64) -> bool {
     }
 }
 
+/// Three-way classification of a device-flow credential blob. Drives both
+/// `Provider::is_authenticated` and the `(oauth, …)` suffix emitted by
+/// `mixer auth status` (per plan.md §3.6.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OauthFreshness {
+    /// `expires_at` is in the future (or missing — treat as "still good" so
+    /// older blobs written before `expires_at` tracking existed don't surface
+    /// as spuriously expired; the real clock check happens at dispatch time).
+    Valid,
+    /// Access token is expired but a non-empty `refresh_token` is stored, so
+    /// the next dispatch can transparently recover.
+    ExpiredRefreshable,
+    /// Access token is expired and there is no refresh token — only a full
+    /// `mixer auth login` can recover.
+    ExpiredDead,
+}
+
+/// Classify the OAuth freshness of a device-flow credential blob relative to
+/// `now_secs`. Uses [`current_expiry`] so both the explicit `expires_at`
+/// field and a JWT `exp` claim on the access token are honored.
+pub fn oauth_freshness(blob: &Value, now_secs: i64) -> OauthFreshness {
+    let expires_at = current_expiry(blob);
+    let has_refresh = blob
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty());
+    match expires_at {
+        Some(exp) if exp <= now_secs => {
+            if has_refresh {
+                OauthFreshness::ExpiredRefreshable
+            } else {
+                OauthFreshness::ExpiredDead
+            }
+        }
+        _ => OauthFreshness::Valid,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,6 +203,45 @@ mod tests {
             message: "boom".to_string(),
         };
         assert_eq!(format!("{e}"), "boom");
+    }
+
+    #[test]
+    fn oauth_freshness_valid_when_expiry_in_future() {
+        let blob = json!({ "expires_at": 1_000_i64, "refresh_token": "rt" });
+        assert_eq!(oauth_freshness(&blob, 500), OauthFreshness::Valid);
+    }
+
+    #[test]
+    fn oauth_freshness_valid_when_expiry_unknown() {
+        // No expires_at, no JWT access_token — treat as Valid to avoid
+        // spuriously reporting old blobs as expired in `mixer auth status`.
+        let blob = json!({ "access_token": "opaque" });
+        assert_eq!(oauth_freshness(&blob, 99_999), OauthFreshness::Valid);
+    }
+
+    #[test]
+    fn oauth_freshness_expired_refreshable_when_refresh_token_present() {
+        let blob = json!({ "expires_at": 100_i64, "refresh_token": "rt" });
+        assert_eq!(
+            oauth_freshness(&blob, 500),
+            OauthFreshness::ExpiredRefreshable,
+        );
+    }
+
+    #[test]
+    fn oauth_freshness_expired_dead_when_no_refresh_token() {
+        let blob = json!({ "expires_at": 100_i64 });
+        assert_eq!(oauth_freshness(&blob, 500), OauthFreshness::ExpiredDead);
+    }
+
+    #[test]
+    fn oauth_freshness_uses_jwt_exp_fallback() {
+        let token = jwt_with(&json!({ "exp": 100_i64 }));
+        let blob = json!({ "access_token": token, "refresh_token": "rt" });
+        assert_eq!(
+            oauth_freshness(&blob, 500),
+            OauthFreshness::ExpiredRefreshable,
+        );
     }
 
     #[tokio::test]

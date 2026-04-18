@@ -21,12 +21,10 @@ async fn list(verbose: bool, as_json: bool) -> Result<()> {
     let mut rows = Vec::new();
     for id in registry.ids() {
         let p = registry.get(id)?;
-        let authed = p.is_authenticated(&credentials);
-        let enabled = config.providers.get(id).map(|s| s.enabled).unwrap_or(true);
-        let max_conc = config
-            .providers
-            .get(id)
-            .and_then(|s| s.max_concurrent_requests);
+        let settings = config.providers.get(id).cloned().unwrap_or_default();
+        let authed = p.is_authenticated(&credentials, &settings);
+        let enabled = settings.enabled;
+        let max_conc = settings.max_concurrent_requests;
         rows.push(json!({
             "id": p.id(),
             "display_name": p.display_name(),
@@ -86,7 +84,7 @@ async fn show(name: &str, as_json: bool) -> Result<()> {
     let payload = json!({
         "id": p.id(),
         "display_name": p.display_name(),
-        "authenticated": p.is_authenticated(&credentials),
+        "authenticated": p.is_authenticated(&credentials, &settings),
         "settings": settings,
         "usage": usage,
         "models": p.models().into_iter().map(|m| json!({

@@ -9,7 +9,7 @@ use futures::stream;
 use crate::config::ProviderSettings;
 use crate::credentials::CredentialStore;
 use crate::openai::ChatRequest;
-use crate::providers::{ChatStream, ModelInfo, Provider};
+use crate::providers::{AuthKind, ChatStream, ModelInfo, Provider};
 
 pub struct GlmProvider;
 
@@ -36,6 +36,16 @@ impl Provider for GlmProvider {
                 supports_images: true,
             },
         ]
+    }
+
+    fn auth_kind(&self) -> AuthKind {
+        AuthKind::ApiKey
+    }
+
+    fn is_authenticated(&self, store: &CredentialStore, settings: &ProviderSettings) -> bool {
+        store
+            .load_api_key(self.id(), settings)
+            .is_some_and(|s| !s.is_empty())
     }
 
     async fn login(&self, _store: &CredentialStore) -> Result<()> {

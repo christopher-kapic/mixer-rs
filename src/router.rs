@@ -86,7 +86,12 @@ fn filter_candidates<'a>(
             let Ok(provider) = registry.get(&b.provider) else {
                 return false;
             };
-            if !provider.is_authenticated(credentials) {
+            let settings = config
+                .providers
+                .get(&b.provider)
+                .cloned()
+                .unwrap_or_default();
+            if !provider.is_authenticated(credentials, &settings) {
                 return false;
             }
             if requires_images {

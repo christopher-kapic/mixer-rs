@@ -122,6 +122,14 @@ impl CredentialStore {
     fn with_dir(dir: PathBuf) -> Self {
         Self { dir }
     }
+
+    /// Test-only constructor that stores credentials under `dir` instead of
+    /// the user's XDG directory. Visible across the crate so server-level
+    /// tests can build a fake store.
+    #[cfg(test)]
+    pub(crate) fn with_dir_for_tests(dir: PathBuf) -> Self {
+        Self { dir }
+    }
 }
 
 #[cfg(test)]

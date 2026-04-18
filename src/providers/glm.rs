@@ -2,13 +2,14 @@
 //!
 //! Status: scaffold.
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
+use futures::stream;
 
 use crate::config::ProviderSettings;
 use crate::credentials::CredentialStore;
-use crate::openai::{ChatRequest, ChatResponse};
-use crate::providers::{ModelInfo, Provider};
+use crate::openai::ChatRequest;
+use crate::providers::{ChatStream, ModelInfo, Provider};
 
 pub struct GlmProvider;
 
@@ -47,9 +48,11 @@ impl Provider for GlmProvider {
         _store: &CredentialStore,
         _settings: &ProviderSettings,
         _req: ChatRequest,
-    ) -> Result<ChatResponse> {
+    ) -> Result<ChatStream> {
         // TODO: POST to the z.ai Anthropic-compatible or OpenAI-compatible
-        //       endpoint and map the response.
-        bail!("glm chat_completion not yet implemented")
+        //       endpoint and map the response into ChatCompletionChunks.
+        Ok(Box::pin(stream::once(async {
+            Err(anyhow!("glm chat_completion not yet implemented"))
+        })))
     }
 }

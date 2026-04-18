@@ -7,13 +7,14 @@
 //! implemented` until the session-handshake and request-forwarding logic is
 //! ported in.
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
+use futures::stream;
 
 use crate::config::ProviderSettings;
 use crate::credentials::CredentialStore;
-use crate::openai::{ChatRequest, ChatResponse};
-use crate::providers::{ModelInfo, Provider};
+use crate::openai::ChatRequest;
+use crate::providers::{ChatStream, ModelInfo, Provider};
 
 pub struct CodexProvider;
 
@@ -54,10 +55,11 @@ impl Provider for CodexProvider {
         _store: &CredentialStore,
         _settings: &ProviderSettings,
         _req: ChatRequest,
-    ) -> Result<ChatResponse> {
+    ) -> Result<ChatStream> {
         // TODO: refresh the session if needed, POST to the Codex chat
-        //       completions endpoint, and map the response into the
-        //       OpenAI-compatible shape.
-        bail!("codex chat_completion not yet implemented")
+        //       completions endpoint, and map SSE frames to ChatCompletionChunks.
+        Ok(Box::pin(stream::once(async {
+            Err(anyhow!("codex chat_completion not yet implemented"))
+        })))
     }
 }

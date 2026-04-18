@@ -2,13 +2,14 @@
 //!
 //! Status: scaffold.
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
+use futures::stream;
 
 use crate::config::ProviderSettings;
 use crate::credentials::CredentialStore;
-use crate::openai::{ChatRequest, ChatResponse};
-use crate::providers::{ModelInfo, Provider};
+use crate::openai::ChatRequest;
+use crate::providers::{ChatStream, ModelInfo, Provider};
 
 pub struct MinimaxProvider;
 
@@ -47,9 +48,11 @@ impl Provider for MinimaxProvider {
         _store: &CredentialStore,
         _settings: &ProviderSettings,
         _req: ChatRequest,
-    ) -> Result<ChatResponse> {
+    ) -> Result<ChatStream> {
         // TODO: POST to the Minimax /v1/chat/completions endpoint with the
-        //       stored key and map the response body.
-        bail!("minimax chat_completion not yet implemented")
+        //       stored key and map the response body into ChatCompletionChunks.
+        Ok(Box::pin(stream::once(async {
+            Err(anyhow!("minimax chat_completion not yet implemented"))
+        })))
     }
 }

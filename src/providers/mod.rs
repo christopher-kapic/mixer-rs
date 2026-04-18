@@ -12,15 +12,22 @@ pub mod minimax;
 pub mod opencode;
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use futures::Stream;
 
 use crate::config::ProviderSettings;
 use crate::credentials::CredentialStore;
-use crate::openai::{ChatRequest, ChatResponse};
+use crate::openai::{ChatCompletionChunk, ChatRequest};
 use crate::usage::UsageSnapshot;
+
+/// Streaming output of [`Provider::chat_completion`]. The server adapts this
+/// to either an SSE response (when the client asked for `stream: true`) or a
+/// single accumulated JSON response.
+pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>>;
 
 /// What a provider's model can process. A model is omitted from the pool for
 /// image-bearing requests when `supports_images == false`.
@@ -67,13 +74,15 @@ pub trait Provider: Send + Sync {
 
     /// Execute a chat completion. `req.model` has already been rewritten by
     /// the router to the provider-native model id; `settings` carries the
-    /// user's overrides (base URL, timeout, etc.).
+    /// user's overrides (base URL, timeout, etc.). Providers always return a
+    /// stream of [`ChatCompletionChunk`]s; the server collapses them into a
+    /// single response for non-streaming clients.
     async fn chat_completion(
         &self,
         store: &CredentialStore,
         settings: &ProviderSettings,
         req: ChatRequest,
-    ) -> Result<ChatResponse>;
+    ) -> Result<ChatStream>;
 }
 
 /// A registry that owns each [`Provider`] via `Arc<dyn Provider>` and offers

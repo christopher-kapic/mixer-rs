@@ -85,6 +85,8 @@ mixer config set providers.selfhost.max_concurrent_requests 2
 mixer config set providers.selfhost.max_concurrent_requests none   # clear
 ```
 
+The built-in `ollama` provider ships disabled with `max_concurrent_requests: 2` so GPU-constrained hosts can serialize requests out of the box. Enable it with `mixer config set providers.ollama.enabled true` once you have a local ollama server running; tune the cap to whatever your hardware can handle.
+
 ## Adding a provider
 
 One file per provider under `src/providers/`. Drop in `src/providers/myprovider.rs`, implement the `Provider` trait (models, login, chat_completion, optional usage), then register it in `builtin_registry()` in `src/providers/mod.rs`. That's it — routing, auth storage, usage weighting, image filtering, and concurrency caps work automatically.

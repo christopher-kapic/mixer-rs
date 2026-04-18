@@ -44,6 +44,8 @@ pub enum AuthScheme {
     Bearer,
     /// `<header_name>: <api_key>`. Used by opencode (`x-api-key`).
     ApiKeyHeader(&'static str),
+    /// Send no authentication header. Used by self-hosted endpoints (ollama).
+    None,
 }
 
 /// POST an OpenAI-compatible Chat Completions request and return a stream of
@@ -138,6 +140,10 @@ fn apply_auth(builder: RequestBuilder, api_key: &str, auth_scheme: AuthScheme) -
     match auth_scheme {
         AuthScheme::Bearer => builder.bearer_auth(api_key),
         AuthScheme::ApiKeyHeader(name) => builder.header(name, api_key),
+        AuthScheme::None => {
+            let _ = api_key;
+            builder
+        }
     }
 }
 

@@ -156,6 +156,17 @@ impl Default for Config {
         for id in ["codex", "minimax", "glm", "opencode"] {
             providers.insert(id.to_string(), ProviderSettings::default_enabled());
         }
+        // Self-hosted ollama is opt-in: disabled by default, with a sensible
+        // concurrency cap for GPU-constrained hosts. Users flip `enabled` once
+        // they have a local ollama server running.
+        providers.insert(
+            "ollama".to_string(),
+            ProviderSettings {
+                enabled: false,
+                max_concurrent_requests: Some(2),
+                ..ProviderSettings::default_enabled()
+            },
+        );
 
         Self {
             listen_addr: default_listen_addr(),
@@ -243,16 +254,34 @@ mod tests {
     }
 
     #[test]
-    fn default_enables_four_builtin_providers() {
+    fn default_enables_subscription_providers() {
         let c = Config::default();
-        assert!(c.providers.contains_key("codex"));
-        assert!(c.providers.contains_key("minimax"));
-        assert!(c.providers.contains_key("glm"));
-        assert!(c.providers.contains_key("opencode"));
-        for s in c.providers.values() {
-            assert!(s.enabled);
-            assert!(s.max_concurrent_requests.is_none());
+        for id in ["codex", "minimax", "glm", "opencode"] {
+            let s = c
+                .providers
+                .get(id)
+                .unwrap_or_else(|| panic!("missing {id}"));
+            assert!(s.enabled, "{id} should be enabled by default");
+            assert!(
+                s.max_concurrent_requests.is_none(),
+                "{id} should be uncapped by default",
+            );
         }
+    }
+
+    #[test]
+    fn default_disables_self_hosted_ollama_with_concurrency_cap() {
+        let c = Config::default();
+        let ollama = c
+            .providers
+            .get("ollama")
+            .expect("ollama should be in default providers map");
+        assert!(!ollama.enabled, "ollama is opt-in");
+        assert_eq!(
+            ollama.max_concurrent_requests,
+            Some(2),
+            "default cap guards GPU-constrained hosts",
+        );
     }
 
     #[test]

@@ -10,6 +10,7 @@ pub mod codex;
 pub mod common;
 pub mod glm;
 pub mod minimax;
+pub mod ollama;
 pub mod opencode;
 
 use std::collections::HashMap;
@@ -156,6 +157,7 @@ pub fn builtin_registry() -> ProviderRegistry {
     r.register(Arc::new(minimax::MinimaxProvider));
     r.register(Arc::new(glm::GlmProvider));
     r.register(Arc::new(opencode::OpencodeProvider));
+    r.register(Arc::new(ollama::OllamaProvider));
     r
 }
 
@@ -164,10 +166,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builtin_registry_has_four_providers() {
+    fn builtin_registry_has_all_providers() {
         let r = builtin_registry();
         let ids = r.ids();
-        assert_eq!(ids, vec!["codex", "glm", "minimax", "opencode"]);
+        assert_eq!(ids, vec!["codex", "glm", "minimax", "ollama", "opencode"]);
     }
 
     #[test]

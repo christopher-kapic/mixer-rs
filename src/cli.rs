@@ -71,6 +71,13 @@ pub enum Command {
         /// Shell to generate completions for
         shell: Shell,
     },
+
+    /// Validate config + probe each authenticated provider
+    Doctor {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]

@@ -41,6 +41,7 @@ async fn main() {
         Command::Models { command } => commands::models::run(&command).map(|()| 0),
         Command::Config { command } => commands::config_cmd::run(&command).map(|()| 0),
         Command::Completions { shell } => commands::completions::run(shell).map(|()| 0),
+        Command::Doctor { json } => commands::doctor::run(json).await,
     };
 
     match result {

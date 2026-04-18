@@ -22,7 +22,7 @@ use chrono::Utc;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::sleep;
@@ -30,6 +30,9 @@ use tokio::time::sleep;
 use crate::config::ProviderSettings;
 use crate::credentials::CredentialStore;
 use crate::openai::ChatRequest;
+use crate::providers::common::oauth_refresh::{
+    AuthenticationError, EXPIRY_THRESHOLD_SECS, is_near_expiry, provider_refresh_lock,
+};
 use crate::providers::common::responses_api::{
     chat_request_to_responses_body, responses_sse_to_chat_chunks,
 };
@@ -115,26 +118,28 @@ impl Provider for CodexProvider {
         settings: &ProviderSettings,
         req: ChatRequest,
     ) -> Result<ChatStream> {
-        let (access_token, account_id) = load_codex_auth(store, self.id())?;
+        let client = build_codex_http_client(settings)?;
+        let base = settings.base_url.as_deref().unwrap_or(CHATGPT_BACKEND);
+        let url = format!("{}{RESPONSES_PATH}", base.trim_end_matches('/'));
+        let issuer_base = auth_issuer(settings);
 
         let model = req.model.clone();
         let body = chat_request_to_responses_body(&req, &model);
+        let now = Utc::now().timestamp();
 
-        let base = settings.base_url.as_deref().unwrap_or(CHATGPT_BACKEND);
-        let url = format!("{}{RESPONSES_PATH}", base.trim_end_matches('/'));
+        let (access_token, account_id) =
+            ensure_fresh_codex_token(store, &client, &issuer_base, now).await?;
 
-        let client = build_codex_http_client(settings)?;
+        let resp = send_codex_chat(&client, &url, &access_token, &account_id, &body).await?;
 
-        let resp = client
-            .post(&url)
-            .bearer_auth(&access_token)
-            .header("chatgpt-account-id", &account_id)
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream")
-            .json(&body)
-            .send()
-            .await
-            .context("posting to codex responses endpoint")?;
+        let resp = if resp.status() == StatusCode::UNAUTHORIZED {
+            drop(resp);
+            let (access_token, account_id) =
+                force_refresh_codex_token(store, &client, &issuer_base, &access_token, now).await?;
+            send_codex_chat(&client, &url, &access_token, &account_id, &body).await?
+        } else {
+            resp
+        };
 
         let status = resp.status();
         if !status.is_success() {
@@ -152,11 +157,188 @@ impl Provider for CodexProvider {
     }
 }
 
-fn load_codex_auth(store: &CredentialStore, provider_id: &str) -> Result<(String, String)> {
-    let blob = store
-        .load_blob(provider_id)
+/// Resolve the OAuth issuer base URL for `/oauth/token` calls. In `cfg(test)`
+/// a caller-supplied `base_url` doubles as the issuer so the mock server can
+/// serve both the chat and refresh endpoints. In release builds the issuer
+/// is always the hardcoded production endpoint — a `base_url` override only
+/// affects the chat endpoint (users set it for regional mirrors, not to
+/// redirect auth traffic).
+fn auth_issuer(settings: &ProviderSettings) -> String {
+    #[cfg(test)]
+    if let Some(base) = settings.base_url.as_deref() {
+        return base.trim_end_matches('/').to_string();
+    }
+    let _ = settings;
+    ISSUER.to_string()
+}
+
+async fn send_codex_chat(
+    client: &Client,
+    url: &str,
+    access_token: &str,
+    account_id: &str,
+    body: &Value,
+) -> Result<reqwest::Response> {
+    client
+        .post(url)
+        .bearer_auth(access_token)
+        .header("chatgpt-account-id", account_id)
+        .header("Content-Type", "application/json")
+        .header("Accept", "text/event-stream")
+        .json(body)
+        .send()
+        .await
+        .context("posting to codex responses endpoint")
+}
+
+/// Proactive-refresh entry point: if the stored access token is within
+/// [`EXPIRY_THRESHOLD_SECS`] of expiry, refresh under the per-provider mutex
+/// before returning. Tasks arriving during an in-flight refresh block on the
+/// mutex and, on acquiring it, re-read the freshly written credentials
+/// instead of refreshing again.
+async fn ensure_fresh_codex_token(
+    store: &CredentialStore,
+    client: &Client,
+    issuer_base: &str,
+    now: i64,
+) -> Result<(String, String)> {
+    let blob = load_codex_blob(store)?;
+    if !is_near_expiry(&blob, now, EXPIRY_THRESHOLD_SECS) {
+        return extract_access_and_account(&blob);
+    }
+
+    let lock = provider_refresh_lock("codex");
+    let _guard = lock.lock().await;
+
+    let blob = load_codex_blob(store)?;
+    if !is_near_expiry(&blob, now, EXPIRY_THRESHOLD_SECS) {
+        return extract_access_and_account(&blob);
+    }
+
+    refresh_and_persist(store, client, issuer_base, &blob, now).await
+}
+
+/// 401-fallback entry point: a dispatch came back Unauthorized, so refresh
+/// and retry. If another task raced us to the refresh (its new token is
+/// already on disk), use that token instead of refreshing a second time.
+async fn force_refresh_codex_token(
+    store: &CredentialStore,
+    client: &Client,
+    issuer_base: &str,
+    stale_access_token: &str,
+    now: i64,
+) -> Result<(String, String)> {
+    let lock = provider_refresh_lock("codex");
+    let _guard = lock.lock().await;
+
+    let blob = load_codex_blob(store)?;
+    let current = blob
+        .get("access_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("codex credentials are missing access_token"))?;
+    if current != stale_access_token {
+        return extract_access_and_account(&blob);
+    }
+
+    refresh_and_persist(store, client, issuer_base, &blob, now).await
+}
+
+/// Exchange the stored refresh token for a new access token and persist the
+/// merged credential blob. Preserves `chatgpt_account_id` and any other
+/// fields the provider has written alongside the OAuth tokens.
+async fn refresh_and_persist(
+    store: &CredentialStore,
+    client: &Client,
+    issuer_base: &str,
+    blob: &Value,
+    now: i64,
+) -> Result<(String, String)> {
+    let refresh_token = blob
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::Error::new(AuthenticationError {
+                message: "codex credentials are missing refresh_token — run \
+                          `mixer auth login codex`"
+                    .to_string(),
+            })
+        })?;
+
+    let tokens = refresh_codex_tokens_via_http(client, issuer_base, refresh_token).await?;
+
+    let mut new_blob = blob.clone();
+    let map = new_blob
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("codex credentials blob is not an object"))?;
+    map.insert("access_token".to_string(), json!(tokens.access_token));
+    if let Some(rt) = &tokens.refresh_token {
+        map.insert("refresh_token".to_string(), json!(rt));
+    }
+    if let Some(idt) = &tokens.id_token {
+        map.insert("id_token".to_string(), json!(idt));
+    }
+    map.insert(
+        "expires_at".to_string(),
+        json!(compute_expires_at(now, tokens.expires_in)),
+    );
+
+    store.save("codex", &new_blob)?;
+    extract_access_and_account(&new_blob)
+}
+
+async fn refresh_codex_tokens_via_http(
+    client: &Client,
+    issuer_base: &str,
+    refresh_token: &str,
+) -> Result<CodexTokens> {
+    let url = format!("{}/oauth/token", issuer_base.trim_end_matches('/'));
+    let form: [(&str, &str); 3] = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("client_id", CLIENT_ID),
+    ];
+
+    let resp = client
+        .post(&url)
+        .form(&form)
+        .send()
+        .await
+        .context("posting to codex /oauth/token (refresh)")?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_client_error() {
+            // Revoked / invalid refresh token — credentials are dead and no
+            // amount of retrying will help. Surface as authentication_error.
+            return Err(anyhow::Error::new(AuthenticationError {
+                message: "codex credentials expired — run `mixer auth login codex`".to_string(),
+            }));
+        }
+        bail!("codex /oauth/token (refresh) returned {status}: {body}");
+    }
+
+    let parsed: OAuthTokenResp = resp
+        .json()
+        .await
+        .context("parsing codex refresh-token response")?;
+    Ok(CodexTokens {
+        access_token: parsed.access_token,
+        refresh_token: parsed.refresh_token,
+        id_token: parsed.id_token,
+        expires_in: parsed.expires_in,
+    })
+}
+
+fn load_codex_blob(store: &CredentialStore) -> Result<Value> {
+    store
+        .load_blob("codex")
         .with_context(|| "loading codex credentials")?
-        .ok_or_else(|| anyhow!("codex is not authenticated; run `mixer auth login codex`"))?;
+        .ok_or_else(|| anyhow!("codex is not authenticated; run `mixer auth login codex`"))
+}
+
+fn extract_access_and_account(blob: &Value) -> Result<(String, String)> {
     let access_token = blob
         .get("access_token")
         .and_then(Value::as_str)
@@ -690,6 +872,8 @@ mod tests {
 
     #[tokio::test]
     async fn chat_completion_surfaces_upstream_error_body() {
+        // 5xx responses skip the refresh-retry path (only 401 triggers it),
+        // so this test exercises raw status + body surfacing.
         let tmp = tempfile::TempDir::new().unwrap();
         let store = CredentialStore::with_dir_for_tests(tmp.path().to_path_buf());
         write_creds(&store);
@@ -700,10 +884,9 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let server = tokio::spawn(async move {
             spawn_mock_server(
-                "HTTP/1.1 401 Unauthorized",
+                "HTTP/1.1 500 Internal Server Error",
                 "application/json",
-                r#"{"error":{"message":"token expired","type":"invalid_request_error"}}"#
-                    .to_string(),
+                r#"{"error":{"message":"upstream oops","type":"server_error"}}"#.to_string(),
                 auth,
                 account,
                 tx,
@@ -723,13 +906,13 @@ mod tests {
         server.await.unwrap();
         let err = match result {
             Err(e) => e,
-            Ok(_) => panic!("401 should surface as an error, got Ok stream"),
+            Ok(_) => panic!("5xx should surface as an error, got Ok stream"),
         };
 
         let msg = format!("{err:#}");
-        assert!(msg.contains("401"), "error should include status: {msg}");
+        assert!(msg.contains("500"), "error should include status: {msg}");
         assert!(
-            msg.contains("token expired"),
+            msg.contains("upstream oops"),
             "error should include body snippet: {msg}"
         );
     }
@@ -774,5 +957,436 @@ mod tests {
             err.to_string().contains("chatgpt_account_id"),
             "unexpected error: {err:#}"
         );
+    }
+
+    // ── OAuth refresh tests ─────────────────────────────────────────────────
+
+    mod refresh {
+        use super::*;
+        use std::sync::Mutex as StdMutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::{
+            Form, Router, body::Body, extract::State, http::HeaderMap, response::Response,
+            routing::post,
+        };
+        use serde::Deserialize;
+
+        enum ChatPlan {
+            AlwaysOk,
+            UnauthorizedThenOk,
+            AlwaysUnauthorized,
+        }
+
+        enum RefreshPlan {
+            NewAccessToken {
+                access_token: String,
+                expires_in: u64,
+            },
+            Unauthorized,
+        }
+
+        struct MockState {
+            refresh_calls: AtomicUsize,
+            chat_calls: AtomicUsize,
+            chat_auth_tokens: StdMutex<Vec<String>>,
+            chat_plan: StdMutex<ChatPlan>,
+            refresh_plan: StdMutex<RefreshPlan>,
+            chat_body: String,
+        }
+
+        #[derive(Deserialize)]
+        struct RefreshForm {
+            grant_type: String,
+        }
+
+        async fn refresh_handler(
+            State(state): State<Arc<MockState>>,
+            Form(form): Form<RefreshForm>,
+        ) -> Response {
+            state.refresh_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(
+                form.grant_type, "refresh_token",
+                "refresh endpoint expects grant_type=refresh_token"
+            );
+
+            let plan = state.refresh_plan.lock().unwrap();
+            match &*plan {
+                RefreshPlan::NewAccessToken {
+                    access_token,
+                    expires_in,
+                } => {
+                    let body = json!({
+                        "access_token": access_token,
+                        "refresh_token": "new-refresh",
+                        "token_type": "Bearer",
+                        "expires_in": expires_in,
+                    })
+                    .to_string();
+                    Response::builder()
+                        .status(200)
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap()
+                }
+                RefreshPlan::Unauthorized => Response::builder()
+                    .status(401)
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"error":"invalid_grant"}"#))
+                    .unwrap(),
+            }
+        }
+
+        async fn chat_handler(
+            State(state): State<Arc<MockState>>,
+            headers: HeaderMap,
+            _body: Body,
+        ) -> Response {
+            let auth = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            state.chat_auth_tokens.lock().unwrap().push(auth);
+            let call_n = state.chat_calls.fetch_add(1, Ordering::SeqCst);
+
+            let unauthorized = || {
+                Response::builder()
+                    .status(401)
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"error":"token expired"}"#))
+                    .unwrap()
+            };
+            let ok = |body: String| {
+                Response::builder()
+                    .status(200)
+                    .header("Content-Type", "text/event-stream")
+                    .body(Body::from(body))
+                    .unwrap()
+            };
+
+            let plan = state.chat_plan.lock().unwrap();
+            match &*plan {
+                ChatPlan::AlwaysOk => ok(state.chat_body.clone()),
+                ChatPlan::UnauthorizedThenOk if call_n == 0 => unauthorized(),
+                ChatPlan::UnauthorizedThenOk => ok(state.chat_body.clone()),
+                ChatPlan::AlwaysUnauthorized => unauthorized(),
+            }
+        }
+
+        async fn start_axum_mock(state: Arc<MockState>) -> SocketAddr {
+            let app = Router::new()
+                .route("/oauth/token", post(refresh_handler))
+                .route("/backend-api/codex/responses", post(chat_handler))
+                .with_state(state);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            addr
+        }
+
+        fn default_sse_body() -> String {
+            sse_body(&[
+                r#"{"type":"response.created","response":{"id":"resp_mock","model":"gpt-5.2","created_at":100}}"#,
+                r#"{"type":"response.output_text.delta","delta":"hi"}"#,
+                r#"{"type":"response.completed","response":{"id":"resp_mock"}}"#,
+            ])
+        }
+
+        fn write_creds_with_expiry(store: &CredentialStore, expires_at: i64) {
+            store
+                .save(
+                    "codex",
+                    &json!({
+                        "access_token": "old-access",
+                        "refresh_token": "stored-refresh",
+                        "chatgpt_account_id": "acc_test",
+                        "expires_at": expires_at,
+                    }),
+                )
+                .unwrap();
+        }
+
+        fn mock_state(chat: ChatPlan, refresh: RefreshPlan) -> Arc<MockState> {
+            Arc::new(MockState {
+                refresh_calls: AtomicUsize::new(0),
+                chat_calls: AtomicUsize::new(0),
+                chat_auth_tokens: StdMutex::new(Vec::new()),
+                chat_plan: StdMutex::new(chat),
+                refresh_plan: StdMutex::new(refresh),
+                chat_body: default_sse_body(),
+            })
+        }
+
+        fn settings_for(addr: SocketAddr) -> ProviderSettings {
+            ProviderSettings {
+                base_url: Some(format!("http://{addr}")),
+                ..ProviderSettings::default_enabled()
+            }
+        }
+
+        #[tokio::test]
+        async fn near_expiry_triggers_proactive_refresh_before_dispatch() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = CredentialStore::with_dir_for_tests(tmp.path().to_path_buf());
+            let near = Utc::now().timestamp() + 30;
+            write_creds_with_expiry(&store, near);
+
+            let mock = mock_state(
+                ChatPlan::AlwaysOk,
+                RefreshPlan::NewAccessToken {
+                    access_token: "refreshed-access".to_string(),
+                    expires_in: 3600,
+                },
+            );
+            let addr = start_axum_mock(Arc::clone(&mock)).await;
+
+            let stream = CodexProvider
+                .chat_completion(&store, &settings_for(addr), chat_request_for("gpt-5.2"))
+                .await
+                .expect("chat_completion should succeed");
+            let chunks: Vec<_> = stream.collect().await;
+            for r in &chunks {
+                assert!(r.is_ok(), "stream should not error: {r:?}");
+            }
+
+            assert_eq!(
+                mock.refresh_calls.load(Ordering::SeqCst),
+                1,
+                "refresh endpoint should be called exactly once"
+            );
+            assert_eq!(
+                mock.chat_calls.load(Ordering::SeqCst),
+                1,
+                "chat endpoint should be called exactly once"
+            );
+            let tokens = mock.chat_auth_tokens.lock().unwrap();
+            assert_eq!(
+                tokens[0], "Bearer refreshed-access",
+                "chat should be dispatched with the refreshed token"
+            );
+
+            let blob = store.load_blob("codex").unwrap().unwrap();
+            assert_eq!(blob["access_token"], "refreshed-access");
+            assert_eq!(blob["refresh_token"], "new-refresh");
+            assert_eq!(
+                blob["chatgpt_account_id"], "acc_test",
+                "account id should be preserved across refresh"
+            );
+        }
+
+        #[tokio::test]
+        async fn dispatch_401_triggers_single_refresh_and_retry() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = CredentialStore::with_dir_for_tests(tmp.path().to_path_buf());
+            let far = Utc::now().timestamp() + 100_000;
+            write_creds_with_expiry(&store, far);
+
+            let mock = mock_state(
+                ChatPlan::UnauthorizedThenOk,
+                RefreshPlan::NewAccessToken {
+                    access_token: "post-401-access".to_string(),
+                    expires_in: 3600,
+                },
+            );
+            let addr = start_axum_mock(Arc::clone(&mock)).await;
+
+            let stream = CodexProvider
+                .chat_completion(&store, &settings_for(addr), chat_request_for("gpt-5.2"))
+                .await
+                .expect("chat_completion should succeed after retry");
+            let _: Vec<_> = stream.collect().await;
+
+            assert_eq!(
+                mock.refresh_calls.load(Ordering::SeqCst),
+                1,
+                "exactly one refresh after a 401"
+            );
+            assert_eq!(
+                mock.chat_calls.load(Ordering::SeqCst),
+                2,
+                "chat called twice: first 401, then success"
+            );
+            let tokens = mock.chat_auth_tokens.lock().unwrap();
+            assert_eq!(tokens[0], "Bearer old-access");
+            assert_eq!(tokens[1], "Bearer post-401-access");
+        }
+
+        #[tokio::test]
+        async fn second_401_after_retry_surfaces_as_upstream_error() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = CredentialStore::with_dir_for_tests(tmp.path().to_path_buf());
+            let far = Utc::now().timestamp() + 100_000;
+            write_creds_with_expiry(&store, far);
+
+            let mock = mock_state(
+                ChatPlan::AlwaysUnauthorized,
+                RefreshPlan::NewAccessToken {
+                    access_token: "new-access".to_string(),
+                    expires_in: 3600,
+                },
+            );
+            let addr = start_axum_mock(Arc::clone(&mock)).await;
+
+            let result = CodexProvider
+                .chat_completion(&store, &settings_for(addr), chat_request_for("gpt-5.2"))
+                .await;
+
+            assert_eq!(
+                mock.chat_calls.load(Ordering::SeqCst),
+                2,
+                "chat should be called exactly twice (no third try)"
+            );
+            assert_eq!(
+                mock.refresh_calls.load(Ordering::SeqCst),
+                1,
+                "refresh should be called exactly once"
+            );
+
+            let err = match result {
+                Err(e) => e,
+                Ok(_) => panic!("a second 401 should surface as an error"),
+            };
+            assert!(
+                err.downcast_ref::<AuthenticationError>().is_none(),
+                "persistent upstream 401 is an upstream error, not an authentication_error"
+            );
+            let msg = format!("{err:#}");
+            assert!(msg.contains("401"), "error should mention status: {msg}");
+        }
+
+        #[tokio::test]
+        async fn concurrent_requests_issue_single_refresh() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = CredentialStore::with_dir_for_tests(tmp.path().to_path_buf());
+            let near = Utc::now().timestamp() + 30;
+            write_creds_with_expiry(&store, near);
+
+            let mock = mock_state(
+                ChatPlan::AlwaysOk,
+                RefreshPlan::NewAccessToken {
+                    access_token: "concurrent-access".to_string(),
+                    expires_in: 3600,
+                },
+            );
+            let addr = start_axum_mock(Arc::clone(&mock)).await;
+
+            let store = Arc::new(store);
+            let settings = Arc::new(settings_for(addr));
+
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let store = Arc::clone(&store);
+                    let settings = Arc::clone(&settings);
+                    tokio::spawn(async move {
+                        let stream = CodexProvider
+                            .chat_completion(&store, &settings, chat_request_for("gpt-5.2"))
+                            .await
+                            .expect("chat_completion should succeed");
+                        let _: Vec<_> = stream.collect().await;
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.await.unwrap();
+            }
+
+            assert_eq!(
+                mock.refresh_calls.load(Ordering::SeqCst),
+                1,
+                "mutex should serialize refresh to a single HTTP call across 8 concurrent requests"
+            );
+            assert_eq!(
+                mock.chat_calls.load(Ordering::SeqCst),
+                8,
+                "all eight chat requests should complete"
+            );
+            let tokens = mock.chat_auth_tokens.lock().unwrap();
+            for (i, t) in tokens.iter().enumerate() {
+                assert_eq!(
+                    t, "Bearer concurrent-access",
+                    "chat call #{i} should use the refreshed token"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn refresh_endpoint_rejection_surfaces_as_authentication_error() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = CredentialStore::with_dir_for_tests(tmp.path().to_path_buf());
+            let expired = Utc::now().timestamp() - 100;
+            write_creds_with_expiry(&store, expired);
+
+            let mock = mock_state(ChatPlan::AlwaysOk, RefreshPlan::Unauthorized);
+            let addr = start_axum_mock(Arc::clone(&mock)).await;
+
+            let result = CodexProvider
+                .chat_completion(&store, &settings_for(addr), chat_request_for("gpt-5.2"))
+                .await;
+
+            let err = match result {
+                Err(e) => e,
+                Ok(_) => panic!("refresh rejection should propagate as error"),
+            };
+            let auth_err = err
+                .downcast_ref::<AuthenticationError>()
+                .expect("refresh rejection should downcast to AuthenticationError");
+            assert!(
+                auth_err.message.contains("mixer auth login codex"),
+                "error message should include the login command: {}",
+                auth_err.message
+            );
+
+            assert_eq!(mock.refresh_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                mock.chat_calls.load(Ordering::SeqCst),
+                0,
+                "chat should not be dispatched when the proactive refresh fails"
+            );
+        }
+
+        #[tokio::test]
+        async fn dispatch_401_without_refresh_token_surfaces_as_authentication_error() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = CredentialStore::with_dir_for_tests(tmp.path().to_path_buf());
+            let far = Utc::now().timestamp() + 100_000;
+            // Credentials with no refresh_token — a 401 cannot be recovered.
+            store
+                .save(
+                    "codex",
+                    &json!({
+                        "access_token": "no-refresh-access",
+                        "chatgpt_account_id": "acc_test",
+                        "expires_at": far,
+                    }),
+                )
+                .unwrap();
+
+            let mock = mock_state(
+                ChatPlan::AlwaysUnauthorized,
+                RefreshPlan::NewAccessToken {
+                    access_token: "unused".to_string(),
+                    expires_in: 3600,
+                },
+            );
+            let addr = start_axum_mock(Arc::clone(&mock)).await;
+
+            let result = CodexProvider
+                .chat_completion(&store, &settings_for(addr), chat_request_for("gpt-5.2"))
+                .await;
+
+            let err = match result {
+                Err(e) => e,
+                Ok(_) => panic!("401 without refresh_token should error"),
+            };
+            let auth_err = err
+                .downcast_ref::<AuthenticationError>()
+                .expect("should be AuthenticationError");
+            assert!(auth_err.message.contains("mixer auth login codex"));
+            assert_eq!(mock.refresh_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(mock.chat_calls.load(Ordering::SeqCst), 1);
+        }
     }
 }

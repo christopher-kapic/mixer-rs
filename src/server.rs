@@ -136,7 +136,7 @@ async fn chat_completions(
         requires_images,
     )
     .await
-    .map_err(AppError::bad_gateway)?;
+    .map_err(AppError::from_provider)?;
 
     eprintln!(
         "[route] mixer_model={mixer_model_name} -> provider={} model={} (images={requires_images})",
@@ -162,7 +162,7 @@ async fn chat_completions(
     let chunks = provider
         .chat_completion(&state.credentials, &settings, req)
         .await
-        .map_err(AppError::bad_gateway)?;
+        .map_err(AppError::from_provider)?;
 
     if wants_stream {
         Ok(sse_response(chunks, permit).into_response())
@@ -170,7 +170,7 @@ async fn chat_completions(
         let mut collected = Vec::new();
         let mut s = chunks;
         while let Some(next) = s.next().await {
-            collected.push(next.map_err(AppError::bad_gateway)?);
+            collected.push(next.map_err(AppError::from_provider)?);
         }
         drop(permit);
         let response = ChatResponse::from_chunks(collected);
@@ -246,6 +246,23 @@ impl AppError {
             kind: "mixer_not_found",
             message: msg.into(),
         }
+    }
+
+    /// Classify a provider error: downcast to [`AuthenticationError`] for a
+    /// 401 with `type: "authentication_error"` (so OpenAI SDKs surface the
+    /// actionable "run `mixer auth login`" message as a real auth error),
+    /// otherwise fall through to `bad_gateway`.
+    fn from_provider(e: anyhow::Error) -> Self {
+        if let Some(auth) =
+            e.downcast_ref::<crate::providers::common::oauth_refresh::AuthenticationError>()
+        {
+            return Self {
+                status: StatusCode::UNAUTHORIZED,
+                kind: "authentication_error",
+                message: auth.message.clone(),
+            };
+        }
+        Self::bad_gateway(e)
     }
 }
 

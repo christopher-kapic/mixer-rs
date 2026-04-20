@@ -332,8 +332,11 @@ async fn usage_aware_pick(
         let w = match registry.get(&b.provider) {
             Ok(p) => {
                 // Cache the snapshot per provider so a chatty client doesn't
-                // hammer every provider's usage endpoint on every request, and
-                // a slow endpoint stalls at most one routing pass per TTL.
+                // hammer every provider's usage endpoint on every request.
+                // Concurrent misses for the same provider coalesce behind the
+                // cache's per-key async lock, so a burst of in-flight routing
+                // passes after startup or TTL expiry makes at most one call
+                // into the provider's usage endpoint.
                 let result = usage_cache
                     .get_or_fetch(&b.provider, || async {
                         p.usage(credentials, &settings).await

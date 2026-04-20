@@ -1613,8 +1613,10 @@ mod tests {
             let writer = CapturedWriter::new();
             let sub = text_subscriber(writer.clone());
             let bound: std::net::SocketAddr = "0.0.0.0:4141".parse().unwrap();
-            let mut cfg = Config::default();
-            cfg.listen_bearer_token_env = None;
+            let cfg = Config {
+                listen_bearer_token_env: None,
+                ..Config::default()
+            };
             tracing::subscriber::with_default(sub, || {
                 maybe_warn_unprotected_bind(&cfg, &bound);
             });
@@ -1654,8 +1656,10 @@ mod tests {
             let writer = CapturedWriter::new();
             let sub = text_subscriber(writer.clone());
             let bound: std::net::SocketAddr = "0.0.0.0:4141".parse().unwrap();
-            let mut cfg = Config::default();
-            cfg.listen_bearer_token_env = Some(name.clone());
+            let cfg = Config {
+                listen_bearer_token_env: Some(name.clone()),
+                ..Config::default()
+            };
             tracing::subscriber::with_default(sub, || {
                 maybe_warn_unprotected_bind(&cfg, &bound);
             });

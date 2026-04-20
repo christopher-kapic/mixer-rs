@@ -9,11 +9,19 @@
 //! with permissions 0600. At dispatch time the key resolves env-var-first via
 //! [`CredentialStore::load_api_key`] so an environment-provided key wins over
 //! anything on disk (see plan.md §3.6.2).
+//!
+//! Usage reporting: the Coding Plan `remains` endpoint at
+//! `https://api.minimax.io/v1/api/openplatform/coding_plan/remains` is public
+//! and Bearer-authenticated. See `fetch_minimax_usage` for details. Users on a
+//! Minimax Token Plan (not the Coding Plan) will fall through to `Ok(None)`;
+//! that endpoint's response shape is not documented, so we don't parse it.
 
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use reqwest::Client;
+use serde_json::Value;
 
 use crate::config::ProviderSettings;
 use crate::credentials::CredentialStore;
@@ -25,6 +33,17 @@ use crate::usage::UsageSnapshot;
 
 const DEFAULT_BASE_URL: &str = "https://api.minimax.chat/v1";
 const CHAT_PATH: &str = "/chat/completions";
+
+/// Default host for the Coding Plan `remains` endpoint. Minimax serves plan
+/// introspection from `api.minimax.io` rather than the chat host, so we keep
+/// it separate from `DEFAULT_BASE_URL`. An override in
+/// `settings.base_url` wins (primarily so tests can point everything at a
+/// mock); when a user overrides this in production to a host that doesn't
+/// expose `/v1/api/openplatform/coding_plan/remains`, the probe 404s and
+/// `usage()` degrades to `Ok(None)` — routing keeps working at a neutral
+/// weight instead of failing.
+const USAGE_BASE_URL: &str = "https://api.minimax.io/v1";
+const USAGE_CODING_PLAN_PATH: &str = "/api/openplatform/coding_plan/remains";
 
 pub struct MinimaxProvider;
 
@@ -60,14 +79,18 @@ impl Provider for MinimaxProvider {
         prompt_and_store_api_key(store, self.id(), self.display_name())
     }
 
-    /// Minimax exposes no public usage/quota endpoint — subscription
-    /// consumption is only visible inside the platform dashboard.
+    /// Best-effort Coding Plan consumption, via
+    /// `GET /v1/api/openplatform/coding_plan/remains`. Any failure — missing
+    /// API key, non-2xx response, malformed body, or simply a Token-Plan
+    /// account (which uses a different, undocumented endpoint) — degrades to
+    /// `Ok(None)` so routing treats this provider as "unknown consumption"
+    /// rather than erroring.
     async fn usage(
         &self,
-        _store: &CredentialStore,
-        _settings: &ProviderSettings,
+        store: &CredentialStore,
+        settings: &ProviderSettings,
     ) -> Result<Option<UsageSnapshot>> {
-        Ok(None)
+        Ok(fetch_minimax_usage(store, settings).await.ok().flatten())
     }
 
     async fn chat_completion(
@@ -84,6 +107,97 @@ impl Provider for MinimaxProvider {
         let timeout = settings.request_timeout_secs.map(Duration::from_secs);
         openai_client::chat_completion(self.id(), &url, &api_key, AuthScheme::Bearer, timeout, req)
             .await
+    }
+}
+
+/// Fetch the Coding Plan `remains` endpoint and translate it to a
+/// [`UsageSnapshot`]. The caller wraps any error into `Ok(None)`.
+async fn fetch_minimax_usage(
+    store: &CredentialStore,
+    settings: &ProviderSettings,
+) -> Result<Option<UsageSnapshot>> {
+    let Some(api_key) = store.load_api_key("minimax", settings) else {
+        return Ok(None);
+    };
+    let base = settings.base_url.as_deref().unwrap_or(USAGE_BASE_URL);
+    let url = format!("{}{USAGE_CODING_PLAN_PATH}", base.trim_end_matches('/'));
+
+    let mut builder = Client::builder();
+    if let Some(secs) = settings.request_timeout_secs {
+        builder = builder.timeout(Duration::from_secs(secs));
+    }
+    let client = builder
+        .build()
+        .context("building reqwest client for minimax")?;
+
+    let resp = client
+        .get(&url)
+        .bearer_auth(&api_key)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .context("requesting minimax usage endpoint")?;
+
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+
+    let body: Value = resp
+        .json()
+        .await
+        .context("parsing minimax usage response")?;
+    Ok(extract_minimax_usage_snapshot(&body))
+}
+
+/// Translate a Coding Plan `remains` body into a [`UsageSnapshot`]. Picks the
+/// most-consumed bucket across `modelRemains[]` since that's what will rate-
+/// limit the user first; for routing we want the provider's tightest
+/// constraint, not an average. Returns `None` when the body shape is
+/// unrecognisable (e.g. Token-Plan response) or no entry carries both counts.
+fn extract_minimax_usage_snapshot(body: &Value) -> Option<UsageSnapshot> {
+    let models = body.get("modelRemains")?.as_array()?;
+    let mut worst: Option<(f64, u64)> = None;
+    for m in models {
+        let total = m.get("currentIntervalTotalCount").and_then(Value::as_u64)?;
+        if total == 0 {
+            continue;
+        }
+        let remaining = m
+            .get("currentIntervalRemainingCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(total);
+        let used = (total - remaining) as f64 / total as f64;
+        let window_secs = match (
+            m.get("startTime").and_then(Value::as_i64),
+            m.get("endTime").and_then(Value::as_i64),
+        ) {
+            (Some(s), Some(e)) if e > s => (e - s) as u64,
+            _ => 0,
+        };
+        if worst.is_none_or(|(w, _)| used > w) {
+            worst = Some((used, window_secs));
+        }
+    }
+    let (used, secs) = worst?;
+    let used = used.clamp(0.0, 1.0);
+    Some(UsageSnapshot {
+        fraction_used: Some(used),
+        window: minimax_window_name(secs),
+        label: Some(format!("{:.1}% of coding plan used", used * 100.0)),
+    })
+}
+
+fn minimax_window_name(secs: u64) -> String {
+    const HOUR: u64 = 3600;
+    const DAY: u64 = 24 * HOUR;
+    match secs {
+        0 => "window".to_string(),
+        s if s < HOUR => "minutes".to_string(),
+        s if s < DAY => "hourly".to_string(),
+        s if s < 7 * DAY => "daily".to_string(),
+        s if s < 30 * DAY => "weekly".to_string(),
+        _ => "monthly".to_string(),
     }
 }
 
@@ -194,15 +308,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn usage_returns_none() {
+    async fn usage_returns_none_without_credentials() {
         let tmp = TempDir::new().unwrap();
         let store = store_in(&tmp);
         let settings = ProviderSettings::default_enabled();
         let snap = MinimaxProvider.usage(&store, &settings).await.unwrap();
-        assert!(
-            snap.is_none(),
-            "minimax has no public usage endpoint — must return Ok(None)"
-        );
+        assert!(snap.is_none(), "no api key → Ok(None)");
     }
 
     #[tokio::test]
@@ -237,5 +348,228 @@ mod tests {
             Some("Bearer sk-from-env"),
             "env var should shadow the stored file key",
         );
+    }
+
+    // ── usage() tests ───────────────────────────────────────────────────────
+
+    mod usage {
+        use super::*;
+        use axum::{
+            Router, body::Body, extract::State, http::HeaderMap, response::Response, routing::get,
+        };
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::sync::Mutex as StdMutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        #[test]
+        fn extract_snapshot_picks_highest_used_across_models() {
+            let body = json!({
+                "modelRemains": [
+                    {
+                        "modelName": "MiniMax-M2",
+                        "startTime": 1_000_000,
+                        "endTime": 1_018_000, // 18_000s = 5h
+                        "currentIntervalTotalCount": 1000,
+                        "currentIntervalRemainingCount": 900 // 10% used
+                    },
+                    {
+                        "modelName": "MiniMax-M2-vl",
+                        "startTime": 1_000_000,
+                        "endTime": 1_018_000,
+                        "currentIntervalTotalCount": 200,
+                        "currentIntervalRemainingCount": 50 // 75% used — worst
+                    }
+                ]
+            });
+            let snap = extract_minimax_usage_snapshot(&body).expect("snapshot");
+            assert_eq!(snap.fraction_used, Some(0.75));
+            assert_eq!(snap.window, "hourly");
+            let label = snap.label.unwrap();
+            assert!(label.contains("75.0"), "label mentions percent: {label}");
+        }
+
+        #[test]
+        fn extract_snapshot_returns_none_without_model_remains() {
+            assert!(extract_minimax_usage_snapshot(&json!({ "other": "field" })).is_none());
+        }
+
+        #[test]
+        fn extract_snapshot_returns_none_when_all_entries_missing_counts() {
+            let body = json!({
+                "modelRemains": [
+                    { "modelName": "m" }
+                ]
+            });
+            assert!(extract_minimax_usage_snapshot(&body).is_none());
+        }
+
+        #[test]
+        fn extract_snapshot_clamps_remaining_above_total() {
+            // Defensive: a server glitch could emit remaining > total; clamp
+            // rather than underflow the unsigned subtraction.
+            let body = json!({
+                "modelRemains": [
+                    {
+                        "currentIntervalTotalCount": 100,
+                        "currentIntervalRemainingCount": 999
+                    }
+                ]
+            });
+            let snap = extract_minimax_usage_snapshot(&body).expect("snapshot");
+            assert_eq!(snap.fraction_used, Some(0.0));
+        }
+
+        #[test]
+        fn extract_snapshot_zero_total_is_skipped() {
+            let body = json!({
+                "modelRemains": [
+                    { "currentIntervalTotalCount": 0, "currentIntervalRemainingCount": 0 }
+                ]
+            });
+            assert!(extract_minimax_usage_snapshot(&body).is_none());
+        }
+
+        #[test]
+        fn window_name_maps_seconds_to_label() {
+            assert_eq!(minimax_window_name(0), "window");
+            assert_eq!(minimax_window_name(60), "minutes");
+            assert_eq!(minimax_window_name(3600), "hourly");
+            assert_eq!(minimax_window_name(86_400), "daily");
+            assert_eq!(minimax_window_name(7 * 86_400), "weekly");
+            assert_eq!(minimax_window_name(60 * 86_400), "monthly");
+        }
+
+        // ── mocked /v1/api/openplatform/coding_plan/remains ────────────────
+
+        struct UsageMock {
+            calls: AtomicUsize,
+            auth_tokens: StdMutex<Vec<String>>,
+            status: u16,
+            body: String,
+        }
+
+        async fn usage_handler(
+            State(state): State<Arc<UsageMock>>,
+            headers: HeaderMap,
+        ) -> Response {
+            state.calls.fetch_add(1, Ordering::SeqCst);
+            let auth = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            state.auth_tokens.lock().unwrap().push(auth);
+            Response::builder()
+                .status(state.status)
+                .header("Content-Type", "application/json")
+                .body(Body::from(state.body.clone()))
+                .unwrap()
+        }
+
+        async fn start_usage_mock(state: Arc<UsageMock>) -> SocketAddr {
+            let app = Router::new()
+                .route(USAGE_CODING_PLAN_PATH, get(usage_handler))
+                .with_state(state);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            addr
+        }
+
+        fn write_key(store: &CredentialStore) {
+            store
+                .save("minimax", &json!({ "api_key": "sk-minimax-test" }))
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn usage_returns_snapshot_with_bearer_auth() {
+            let tmp = TempDir::new().unwrap();
+            let store = store_in(&tmp);
+            write_key(&store);
+
+            let mock = Arc::new(UsageMock {
+                calls: AtomicUsize::new(0),
+                auth_tokens: StdMutex::new(Vec::new()),
+                status: 200,
+                body: json!({
+                    "modelRemains": [
+                        {
+                            "modelName": "MiniMax-M2",
+                            "startTime": 1_000_000,
+                            "endTime": 1_018_000,
+                            "currentIntervalTotalCount": 1000,
+                            "currentIntervalRemainingCount": 600
+                        }
+                    ]
+                })
+                .to_string(),
+            });
+            let addr = start_usage_mock(Arc::clone(&mock)).await;
+            let settings = settings_with_base(&format!("http://{addr}"));
+
+            let snap = MinimaxProvider
+                .usage(&store, &settings)
+                .await
+                .expect("usage call succeeds")
+                .expect("snapshot present");
+
+            assert_eq!(snap.fraction_used, Some(0.4));
+            assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                mock.auth_tokens.lock().unwrap()[0],
+                "Bearer sk-minimax-test",
+                "usage probe must forward bearer token"
+            );
+        }
+
+        #[tokio::test]
+        async fn usage_returns_none_on_upstream_error() {
+            let tmp = TempDir::new().unwrap();
+            let store = store_in(&tmp);
+            write_key(&store);
+
+            let mock = Arc::new(UsageMock {
+                calls: AtomicUsize::new(0),
+                auth_tokens: StdMutex::new(Vec::new()),
+                status: 500,
+                body: r#"{"error":"oops"}"#.to_string(),
+            });
+            let addr = start_usage_mock(Arc::clone(&mock)).await;
+            let settings = settings_with_base(&format!("http://{addr}"));
+
+            let snap = MinimaxProvider
+                .usage(&store, &settings)
+                .await
+                .expect("usage call succeeds");
+            assert!(snap.is_none(), "5xx should degrade to Ok(None)");
+            assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn usage_returns_none_when_body_unparseable() {
+            let tmp = TempDir::new().unwrap();
+            let store = store_in(&tmp);
+            write_key(&store);
+
+            let mock = Arc::new(UsageMock {
+                calls: AtomicUsize::new(0),
+                auth_tokens: StdMutex::new(Vec::new()),
+                status: 200,
+                body: "not-json".to_string(),
+            });
+            let addr = start_usage_mock(Arc::clone(&mock)).await;
+            let settings = settings_with_base(&format!("http://{addr}"));
+
+            let snap = MinimaxProvider
+                .usage(&store, &settings)
+                .await
+                .expect("usage call succeeds");
+            assert!(snap.is_none(), "malformed body should degrade to Ok(None)");
+        }
     }
 }

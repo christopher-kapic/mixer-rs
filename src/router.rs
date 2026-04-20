@@ -656,7 +656,7 @@ mod tests {
 
     #[test]
     fn sticky_pick_is_deterministic_for_same_key() {
-        let pool = vec![
+        let pool = [
             Backend {
                 provider: "a".to_string(),
                 model: "m1".to_string(),
@@ -683,7 +683,7 @@ mod tests {
         // Drive 1000 random-ish keys through a 3-backend pool and assert we
         // hit every backend at least once. Not a distribution test, just a
         // "consistent hashing doesn't collapse onto one backend" sanity check.
-        let pool = vec![
+        let pool = [
             Backend {
                 provider: "alpha".to_string(),
                 model: "m".to_string(),
@@ -711,7 +711,7 @@ mod tests {
 
     #[test]
     fn sticky_pick_single_backend_always_returns_index_zero() {
-        let pool = vec![Backend {
+        let pool = [Backend {
             provider: "only".to_string(),
             model: "m".to_string(),
         }];

@@ -610,8 +610,10 @@ mod tests {
 
     #[test]
     fn default_model_fails_when_key_missing() {
-        let mut cfg = Config::default();
-        cfg.default_model = "does-not-exist".to_string();
+        let cfg = Config {
+            default_model: "does-not-exist".to_string(),
+            ..Config::default()
+        };
         let result = validate_default_model(&cfg);
         assert_eq!(result.severity, Severity::Fail);
     }
@@ -651,7 +653,7 @@ mod tests {
         let warn = CheckResult::warn("b", "w".to_string());
         let fail = CheckResult::fail("c", "f".to_string());
 
-        assert_eq!(summarize_exit(&[ok.clone()]), 0);
+        assert_eq!(summarize_exit(std::slice::from_ref(&ok)), 0);
         assert_eq!(summarize_exit(&[ok.clone(), warn.clone()]), 1);
         assert_eq!(summarize_exit(&[ok, warn, fail]), 2);
     }

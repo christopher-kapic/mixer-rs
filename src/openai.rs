@@ -166,7 +166,8 @@ pub struct ChatDelta {
 
 impl ChatResponse {
     /// Aggregate a sequence of streaming chunks into a single non-streaming
-    /// [`ChatResponse`]. Concatenates per-choice text deltas, keeps the last
+    /// [`ChatResponse`]. Concatenates per-choice text deltas and tool-call
+    /// argument fragments (keyed by each tool call's `index`), keeps the last
     /// non-null `finish_reason`, and sums numeric usage fields when present.
     pub fn from_chunks(chunks: Vec<ChatCompletionChunk>) -> Self {
         let mut id = String::new();
@@ -182,7 +183,7 @@ impl ChatResponse {
         let mut contents: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
         let mut finishes: std::collections::HashMap<u32, Option<String>> =
             std::collections::HashMap::new();
-        let mut tool_calls: std::collections::HashMap<u32, Option<Value>> =
+        let mut tool_calls: std::collections::HashMap<u32, Vec<Value>> =
             std::collections::HashMap::new();
 
         for chunk in chunks {
@@ -213,7 +214,8 @@ impl ChatResponse {
                     contents.entry(choice.index).or_default().push_str(&text);
                 }
                 if let Some(tc) = choice.delta.tool_calls {
-                    tool_calls.insert(choice.index, Some(tc));
+                    let entry = tool_calls.entry(choice.index).or_default();
+                    merge_tool_call_deltas(entry, tc);
                 }
                 if choice.finish_reason.is_some() {
                     finishes.insert(choice.index, choice.finish_reason);
@@ -232,7 +234,10 @@ impl ChatResponse {
                         .unwrap_or_else(|| "assistant".to_string()),
                     content: MessageContent::Text(contents.remove(&idx).unwrap_or_default()),
                     name: None,
-                    tool_calls: tool_calls.remove(&idx).flatten(),
+                    tool_calls: tool_calls
+                        .remove(&idx)
+                        .filter(|v| !v.is_empty())
+                        .map(Value::Array),
                     tool_call_id: None,
                 },
                 finish_reason: finishes.remove(&idx).flatten(),
@@ -252,14 +257,18 @@ impl ChatResponse {
 }
 
 /// Sum numeric fields of two `usage` objects; non-numeric fields fall back to
-/// the value from `incoming`. Used by [`ChatResponse::from_chunks`].
+/// the value from `incoming`. If either side isn't an object, prefer the
+/// `incoming` view — it's the newer one and the one the upstream just sent.
+/// Used by [`ChatResponse::from_chunks`].
 fn merge_usage(existing: Option<Value>, incoming: Value) -> Value {
     let Some(existing) = existing else {
         return incoming;
     };
-    let (Value::Object(mut a), Value::Object(b)) = (existing, incoming) else {
-        // Couldn't merge structurally — keep the newer view.
-        return Value::Null;
+    let Value::Object(mut a) = existing else {
+        return incoming;
+    };
+    let Value::Object(b) = incoming else {
+        return Value::Object(a);
     };
     for (k, v) in b {
         match (a.get(&k), &v) {
@@ -277,6 +286,81 @@ fn merge_usage(existing: Option<Value>, incoming: Value) -> Value {
         }
     }
     Value::Object(a)
+}
+
+/// Merge an incoming delta's `tool_calls` array into the accumulated per-choice
+/// list. OpenAI streams each tool call in multiple fragments keyed by `index`:
+/// the first fragment typically carries `id`, `type`, and `function.name`;
+/// subsequent fragments extend `function.arguments` character by character.
+/// Without this merge, a non-streaming client would only see the final
+/// fragment and receive a truncated arguments JSON.
+fn merge_tool_call_deltas(accumulated: &mut Vec<Value>, incoming: Value) {
+    let Value::Array(incoming_arr) = incoming else {
+        return;
+    };
+    for item in incoming_arr {
+        let existing_pos = item
+            .as_object()
+            .and_then(|obj| obj.get("index"))
+            .and_then(Value::as_u64)
+            .and_then(|idx| {
+                accumulated.iter().position(|existing| {
+                    existing
+                        .as_object()
+                        .and_then(|obj| obj.get("index"))
+                        .and_then(Value::as_u64)
+                        == Some(idx)
+                })
+            });
+        match existing_pos {
+            Some(pos) => merge_tool_call_into(&mut accumulated[pos], item),
+            None => accumulated.push(item),
+        }
+    }
+}
+
+fn merge_tool_call_into(existing: &mut Value, incoming: Value) {
+    let Value::Object(existing_obj) = existing else {
+        *existing = incoming;
+        return;
+    };
+    let Value::Object(incoming_obj) = incoming else {
+        return;
+    };
+    for (k, v) in incoming_obj {
+        if k == "function" {
+            merge_function_delta(existing_obj, v);
+        } else {
+            existing_obj.entry(k).or_insert(v);
+        }
+    }
+}
+
+fn merge_function_delta(container: &mut serde_json::Map<String, Value>, incoming: Value) {
+    let Value::Object(incoming_fn) = incoming else {
+        return;
+    };
+    let existing_fn = match container.get_mut("function") {
+        Some(Value::Object(m)) => m,
+        _ => {
+            container.insert("function".to_string(), Value::Object(incoming_fn));
+            return;
+        }
+    };
+    for (fk, fv) in incoming_fn {
+        if fk == "arguments" {
+            match (existing_fn.get_mut("arguments"), fv) {
+                (Some(Value::String(existing_s)), Value::String(incoming_s)) => {
+                    existing_s.push_str(&incoming_s);
+                }
+                (_, fv) => {
+                    existing_fn.insert(fk, fv);
+                }
+            }
+        } else {
+            existing_fn.entry(fk).or_insert(fv);
+        }
+    }
 }
 
 /// OpenAI-compatible `/v1/models` response.
@@ -416,5 +500,98 @@ mod tests {
         ];
         let resp = ChatResponse::from_chunks(chunks);
         assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("stop"));
+    }
+
+    fn tool_call_chunk(tool_calls: Value, finish: Option<&str>) -> ChatCompletionChunk {
+        let mut c = chunk("", finish);
+        c.choices[0].delta.tool_calls = Some(tool_calls);
+        c
+    }
+
+    #[test]
+    fn from_chunks_aggregates_tool_call_argument_fragments() {
+        let first = tool_call_chunk(
+            serde_json::json!([{
+                "index": 0,
+                "id": "call_abc",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\""}
+            }]),
+            None,
+        );
+        let second = tool_call_chunk(
+            serde_json::json!([{
+                "index": 0,
+                "function": {"arguments": "city\":"}
+            }]),
+            None,
+        );
+        let third = tool_call_chunk(
+            serde_json::json!([{
+                "index": 0,
+                "function": {"arguments": "\"NYC\"}"}
+            }]),
+            Some("tool_calls"),
+        );
+
+        let resp = ChatResponse::from_chunks(vec![first, second, third]);
+        let tc = resp.choices[0]
+            .message
+            .tool_calls
+            .as_ref()
+            .expect("tool_calls should be set");
+        let arr = tc.as_array().expect("tool_calls should be an array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], "call_abc");
+        assert_eq!(arr[0]["type"], "function");
+        assert_eq!(arr[0]["function"]["name"], "get_weather");
+        assert_eq!(arr[0]["function"]["arguments"], "{\"city\":\"NYC\"}");
+    }
+
+    #[test]
+    fn from_chunks_keeps_parallel_tool_calls_separate() {
+        let first = tool_call_chunk(
+            serde_json::json!([
+                {"index": 0, "id": "call_a", "type": "function", "function": {"name": "f_a", "arguments": "{\"x\":"}},
+                {"index": 1, "id": "call_b", "type": "function", "function": {"name": "f_b", "arguments": "{\"y\":"}}
+            ]),
+            None,
+        );
+        let second = tool_call_chunk(
+            serde_json::json!([
+                {"index": 0, "function": {"arguments": "1}"}},
+                {"index": 1, "function": {"arguments": "2}"}}
+            ]),
+            Some("tool_calls"),
+        );
+
+        let resp = ChatResponse::from_chunks(vec![first, second]);
+        let arr = resp.choices[0]
+            .message
+            .tool_calls
+            .as_ref()
+            .and_then(|v| v.as_array())
+            .expect("tool_calls array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["id"], "call_a");
+        assert_eq!(arr[0]["function"]["arguments"], "{\"x\":1}");
+        assert_eq!(arr[1]["id"], "call_b");
+        assert_eq!(arr[1]["function"]["arguments"], "{\"y\":2}");
+    }
+
+    #[test]
+    fn merge_usage_prefers_incoming_when_existing_is_not_object() {
+        let existing = Some(Value::Null);
+        let incoming = serde_json::json!({"prompt_tokens": 5});
+        let merged = merge_usage(existing, incoming);
+        assert_eq!(merged["prompt_tokens"].as_f64(), Some(5.0));
+    }
+
+    #[test]
+    fn merge_usage_preserves_existing_when_incoming_is_not_object() {
+        let existing = Some(serde_json::json!({"prompt_tokens": 5}));
+        let incoming = Value::Null;
+        let merged = merge_usage(existing, incoming);
+        assert_eq!(merged["prompt_tokens"].as_f64(), Some(5.0));
     }
 }

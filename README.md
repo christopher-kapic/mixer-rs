@@ -113,15 +113,18 @@ impl Provider for MyProvider {
     fn id(&self) -> &'static str { "myprovider" }
     fn display_name(&self) -> &'static str { "My Provider" }
     fn models(&self) -> Vec<ModelInfo> { /* ... */ vec![] }
+    fn auth_kind(&self) -> AuthKind { AuthKind::ApiKey }
     async fn login(&self, store: &CredentialStore) -> Result<()> { /* ... */ Ok(()) }
     async fn chat_completion(
         &self,
         store: &CredentialStore,
         settings: &ProviderSettings,
         req: ChatRequest,
-    ) -> Result<ChatResponse> { /* ... */ todo!() }
+    ) -> Result<ChatStream> { /* stream ChatCompletionChunks */ todo!() }
 }
 ```
+
+Providers always produce a stream of `ChatCompletionChunk`s; the server forwards them as SSE when the client asks for `stream: true` and accumulates them into a single response otherwise.
 
 PRs for new providers welcome.
 

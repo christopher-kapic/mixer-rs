@@ -11,22 +11,31 @@
 //! cap in-flight requests so the server is never asked to service more than
 //! it can handle.
 //!
-//! **Model catalogue:** fetched lazily on the first call to `models()` via
-//! `GET <DEFAULT_BASE_URL>/models`. The result is memoized for the process
-//! lifetime; users must restart mixer to pick up newly-installed ollama
-//! models. The fetch runs on a dedicated OS thread with its own current-
-//! thread tokio runtime so it works regardless of the caller's async context
-//! (nested-runtime panics are avoided). If the ollama server is unreachable
-//! the catalogue is cached as empty and the router then filters this provider
-//! out just like an unauthenticated one.
+//! **Model catalogue:** fetched on the first call to `models()` via
+//! `GET <DEFAULT_BASE_URL>/models`. After that, results are cached for
+//! [`CATALOG_TTL`] (60s); when the cache goes stale we serve the previous
+//! snapshot immediately and kick off a background refresh so newly-installed
+//! ollama models become visible without restarting mixer. The refresh requires
+//! a tokio runtime to be active (CLI commands like `mixer providers list` run
+//! inside one); if not, we skip the refresh and serve stale data — the
+//! catalogue updates next time mixer is invoked.
+//!
+//! The very first fetch runs on a dedicated OS thread with its own
+//! current-thread tokio runtime so it works regardless of the caller's async
+//! context (nested-runtime panics are avoided). If the ollama server is
+//! unreachable we cache an empty catalogue and the router filters this provider
+//! out just like an unauthenticated one — but the TTL still applies, so the
+//! next stale-driven background refresh will pick up the server when it comes
+//! back.
 //!
 //! The catalogue fetch targets the default URL even if the user overrides
 //! `base_url` in config, because `models()` is a synchronous trait method
 //! that has no access to `ProviderSettings`. Chat dispatch respects the
 //! configured `base_url` regardless.
 
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -45,10 +54,28 @@ const MODELS_PATH: &str = "/models";
 /// Short timeout so a stopped ollama server doesn't stall every CLI command
 /// that transitively calls `models()` (e.g. `mixer providers list`).
 const CATALOG_FETCH_TIMEOUT: Duration = Duration::from_millis(500);
+/// How long a fetched catalogue stays fresh before the next call schedules a
+/// background refresh. Picked to be short enough that newly-installed ollama
+/// models surface within a typical iteration cycle, long enough that a normal
+/// request burst doesn't stampede the ollama `/models` endpoint.
+const CATALOG_TTL: Duration = Duration::from_secs(60);
 
 pub struct OllamaProvider;
 
-static MODELS_CACHE: OnceLock<Vec<ModelInfo>> = OnceLock::new();
+#[derive(Default)]
+struct CatalogCache {
+    models: Vec<ModelInfo>,
+    fetched_at: Option<Instant>,
+}
+
+static MODELS_CACHE: OnceLock<Arc<Mutex<CatalogCache>>> = OnceLock::new();
+/// Coalesces concurrent stale-driven background refreshes — only the first
+/// caller wins the CAS and actually fires the fetch.
+static REFRESH_INFLIGHT: AtomicBool = AtomicBool::new(false);
+
+fn catalog_cache() -> &'static Arc<Mutex<CatalogCache>> {
+    MODELS_CACHE.get_or_init(|| Arc::new(Mutex::new(CatalogCache::default())))
+}
 
 #[derive(Deserialize)]
 struct OpenAiModelsResponse {
@@ -73,27 +100,26 @@ async fn fetch_catalog_async(base_url: &str) -> Result<Vec<ModelInfo>> {
     Ok(parsed.data.into_iter().map(entry_to_model_info).collect())
 }
 
-/// Convert an OpenAI-models entry into a [`ModelInfo`]. `ModelInfo` holds
-/// `&'static str`s so the fetched ids are intentionally leaked — bounded by
-/// the size of the catalogue and run at most once per process.
+/// Convert an OpenAI-models entry into a [`ModelInfo`]. The catalogue can
+/// change at runtime (users install new ollama models), so we hold owned
+/// strings rather than leaking — the cache itself bounds memory.
 fn entry_to_model_info(entry: OpenAiModelEntry) -> ModelInfo {
-    let id: &'static str = Box::leak(entry.id.clone().into_boxed_str());
-    let display: &'static str = Box::leak(entry.id.into_boxed_str());
-    ModelInfo {
-        id,
-        display_name: display,
+    ModelInfo::new(
+        entry.id.clone(),
+        entry.id,
         // Ollama's OpenAI-compat API doesn't report vision capability in the
         // catalogue; conservatively assume text-only. Users who need vision
         // routing against ollama can configure a vision-capable mixer model
         // that targets other providers.
-        supports_images: false,
-    }
+        false,
+    )
 }
 
-/// Blocking entry point used by [`OllamaProvider::models`]. Runs the fetch on
-/// a fresh OS thread with its own single-thread tokio runtime so we don't
+/// Blocking entry point used by the very first `models()` call. Runs the fetch
+/// on a fresh OS thread with its own single-thread tokio runtime so we don't
 /// panic when called from either inside a current-thread runtime (like
-/// `#[tokio::test]`) or outside any runtime at all.
+/// `#[tokio::test]`) or outside any runtime at all. Subsequent stale-driven
+/// refreshes use the async path directly via the existing tokio runtime.
 fn fetch_catalog_blocking(base_url: &str) -> Vec<ModelInfo> {
     let base = base_url.to_string();
     std::thread::spawn(move || -> Vec<ModelInfo> {
@@ -109,6 +135,41 @@ fn fetch_catalog_blocking(base_url: &str) -> Vec<ModelInfo> {
     .unwrap_or_default()
 }
 
+/// Snapshot the cached catalogue, returning `(models, age)` where `age` is
+/// `None` until the first fetch has populated the cache.
+fn snapshot_catalog() -> (Vec<ModelInfo>, Option<Duration>) {
+    let cache = catalog_cache().lock().expect("catalog cache poisoned");
+    (cache.models.clone(), cache.fetched_at.map(|t| t.elapsed()))
+}
+
+fn store_catalog(fresh: Vec<ModelInfo>) {
+    let mut cache = catalog_cache().lock().expect("catalog cache poisoned");
+    cache.models = fresh;
+    cache.fetched_at = Some(Instant::now());
+}
+
+/// If we're inside a tokio runtime and no other refresh is already in flight,
+/// kick off a background fetch and update the cache when it returns. The CAS
+/// ensures concurrent stale callers don't stampede ollama's `/models`.
+fn try_spawn_background_refresh() {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    if REFRESH_INFLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    handle.spawn(async {
+        let fresh = fetch_catalog_async(DEFAULT_BASE_URL)
+            .await
+            .unwrap_or_default();
+        store_catalog(fresh);
+        REFRESH_INFLIGHT.store(false, Ordering::Release);
+    });
+}
+
 #[async_trait]
 impl Provider for OllamaProvider {
     fn id(&self) -> &'static str {
@@ -120,9 +181,27 @@ impl Provider for OllamaProvider {
     }
 
     fn models(&self) -> Vec<ModelInfo> {
-        MODELS_CACHE
-            .get_or_init(|| fetch_catalog_blocking(DEFAULT_BASE_URL))
-            .clone()
+        let (cached, age) = snapshot_catalog();
+        match age {
+            // First call ever: block on the fetch so the catalogue is populated
+            // before we return — even an empty result counts (it primes the TTL
+            // so subsequent calls stop blocking).
+            None => {
+                let fresh = fetch_catalog_blocking(DEFAULT_BASE_URL);
+                store_catalog(fresh.clone());
+                fresh
+            }
+            // Fresh enough — serve cached.
+            Some(elapsed) if elapsed < CATALOG_TTL => cached,
+            // Stale — return the cached snapshot now and refresh in the
+            // background so the next call sees the update. If we're not in a
+            // runtime (CLI path), the refresh is silently skipped and the next
+            // invocation will retry.
+            Some(_) => {
+                try_spawn_background_refresh();
+                cached
+            }
+        }
     }
 
     fn auth_kind(&self) -> AuthKind {

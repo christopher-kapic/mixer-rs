@@ -31,6 +31,7 @@ use crate::config::{Backend, Config, MixerModel, RoutingStrategy, StickyKey};
 use crate::credentials::CredentialStore;
 use crate::openai::{ChatMessage, ChatRequest, MessageContent};
 use crate::providers::ProviderRegistry;
+use crate::usage::UsageCache;
 
 #[derive(Debug, Clone)]
 pub struct RouteDecision {
@@ -43,6 +44,7 @@ pub async fn pick(
     config: &Config,
     registry: &ProviderRegistry,
     credentials: &CredentialStore,
+    usage_cache: &UsageCache,
     mixer_model: &MixerModel,
     requires_images: bool,
     sticky_hash: Option<u64>,
@@ -51,6 +53,7 @@ pub async fn pick(
         config,
         registry,
         credentials,
+        usage_cache,
         mixer_model,
         requires_images,
         &[],
@@ -67,6 +70,7 @@ pub async fn pick_excluding(
     config: &Config,
     registry: &ProviderRegistry,
     credentials: &CredentialStore,
+    usage_cache: &UsageCache,
     mixer_model: &MixerModel,
     requires_images: bool,
     excluded: &[Backend],
@@ -118,7 +122,7 @@ to see which providers are authenticated{}",
                 *mixer_model.weights.get(&b.provider).unwrap_or(&1.0)
             })?,
             RoutingStrategy::UsageAware => {
-                usage_aware_pick(config, registry, credentials, &candidates).await?
+                usage_aware_pick(config, registry, credentials, usage_cache, &candidates).await?
             }
         }
     };
@@ -315,6 +319,7 @@ async fn usage_aware_pick(
     config: &Config,
     registry: &ProviderRegistry,
     credentials: &CredentialStore,
+    usage_cache: &UsageCache,
     candidates: &[&Backend],
 ) -> Result<usize> {
     let mut weights = Vec::with_capacity(candidates.len());
@@ -325,14 +330,24 @@ async fn usage_aware_pick(
             .cloned()
             .unwrap_or_default();
         let w = match registry.get(&b.provider) {
-            Ok(p) => match p.usage(credentials, &settings).await {
-                Ok(Some(snap)) => match snap.fraction_used {
-                    Some(f) => (1.0 - f).max(0.05),
-                    None => 0.5,
-                },
-                Ok(None) => 0.5,
-                Err(_) => 0.5,
-            },
+            Ok(p) => {
+                // Cache the snapshot per provider so a chatty client doesn't
+                // hammer every provider's usage endpoint on every request, and
+                // a slow endpoint stalls at most one routing pass per TTL.
+                let result = usage_cache
+                    .get_or_fetch(&b.provider, || async {
+                        p.usage(credentials, &settings).await
+                    })
+                    .await;
+                match result {
+                    Ok(Some(snap)) => match snap.fraction_used {
+                        Some(f) => (1.0 - f).max(0.05),
+                        None => 0.5,
+                    },
+                    Ok(None) => 0.5,
+                    Err(_) => 0.5,
+                }
+            }
             Err(_) => 0.0,
         };
         weights.push(w);
@@ -621,11 +636,7 @@ mod tests {
                 self.0
             }
             fn models(&self) -> Vec<ModelInfo> {
-                vec![ModelInfo {
-                    id: "m",
-                    display_name: "M",
-                    supports_images: false,
-                }]
+                vec![ModelInfo::new("m", "M", false)]
             }
             fn auth_kind(&self) -> AuthKind {
                 AuthKind::ApiKey
@@ -703,11 +714,20 @@ mod tests {
             "messages_hash should produce a key for a multi-turn conversation",
         );
 
+        let usage_cache = UsageCache::default();
         let mut seen = std::collections::HashSet::new();
         for _ in 0..10 {
-            let decision = pick(&config, &registry, &store, &mixer_model, false, sticky_hash)
-                .await
-                .expect("pick should succeed");
+            let decision = pick(
+                &config,
+                &registry,
+                &store,
+                &usage_cache,
+                &mixer_model,
+                false,
+                sticky_hash,
+            )
+            .await
+            .expect("pick should succeed");
             seen.insert((decision.provider_id, decision.provider_model));
         }
         assert_eq!(

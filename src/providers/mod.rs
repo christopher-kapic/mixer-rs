@@ -13,6 +13,7 @@ pub mod minimax;
 pub mod ollama;
 pub mod opencode;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -33,11 +34,29 @@ pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + S
 
 /// What a provider's model can process. A model is omitted from the pool for
 /// image-bearing requests when `supports_images == false`.
+///
+/// `id` and `display_name` are `Cow<'static, str>` so static built-in catalogues
+/// stay zero-alloc (`Cow::Borrowed`) while providers that fetch their catalogue
+/// at runtime — e.g. Ollama — can supply owned strings without leaking memory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelInfo {
-    pub id: &'static str,
-    pub display_name: &'static str,
+    pub id: Cow<'static, str>,
+    pub display_name: Cow<'static, str>,
     pub supports_images: bool,
+}
+
+impl ModelInfo {
+    pub fn new(
+        id: impl Into<Cow<'static, str>>,
+        display_name: impl Into<Cow<'static, str>>,
+        supports_images: bool,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            display_name: display_name.into(),
+            supports_images,
+        }
+    }
 }
 
 /// How a provider authenticates. Drives `mixer auth status` output and lets

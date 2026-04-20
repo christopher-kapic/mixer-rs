@@ -40,16 +40,8 @@ impl Provider for GlmProvider {
 
     fn models(&self) -> Vec<ModelInfo> {
         vec![
-            ModelInfo {
-                id: "glm-4.6",
-                display_name: "GLM 4.6",
-                supports_images: false,
-            },
-            ModelInfo {
-                id: "glm-4.5v",
-                display_name: "GLM 4.5V",
-                supports_images: true,
-            },
+            ModelInfo::new("glm-4.6", "GLM 4.6", false),
+            ModelInfo::new("glm-4.5v", "GLM 4.5V", true),
         ]
     }
 

@@ -44,16 +44,12 @@ impl Provider for OpencodeProvider {
 
     fn models(&self) -> Vec<ModelInfo> {
         vec![
-            ModelInfo {
-                id: "anthropic/claude-sonnet-4-6",
-                display_name: "Claude Sonnet 4.6 (via opencode)",
-                supports_images: true,
-            },
-            ModelInfo {
-                id: "openai/gpt-5.2",
-                display_name: "GPT-5.2 (via opencode)",
-                supports_images: true,
-            },
+            ModelInfo::new(
+                "anthropic/claude-sonnet-4-6",
+                "Claude Sonnet 4.6 (via opencode)",
+                true,
+            ),
+            ModelInfo::new("openai/gpt-5.2", "GPT-5.2 (via opencode)", true),
         ]
     }
 

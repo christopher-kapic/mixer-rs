@@ -55,6 +55,7 @@ use crate::providers::ChatStream;
 use crate::providers::ProviderRegistry;
 use crate::providers::common::oauth_refresh::{AuthenticationError, UpstreamHttpError};
 use crate::router;
+use crate::usage::UsageCache;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -62,6 +63,10 @@ pub struct AppState {
     pub registry: Arc<ProviderRegistry>,
     pub credentials: Arc<CredentialStore>,
     pub concurrency: ConcurrencyLimits,
+    /// Short-TTL cache for `Provider::usage` lookups, consulted by the
+    /// usage-aware router on each pick. Lives on `AppState` so the cache is
+    /// shared across all in-flight requests for a given `mixer serve` process.
+    pub usage_cache: UsageCache,
     /// When `Some`, only this mixer model name is served; all others return
     /// 404. Used by `mixer serve --model <name>`.
     pub pinned_model: Option<String>,
@@ -295,6 +300,7 @@ async fn dispatch_chat(
                 &state.config,
                 &state.registry,
                 &state.credentials,
+                &state.usage_cache,
                 mixer_model,
                 requires_images,
                 sticky_hash,
@@ -305,6 +311,7 @@ async fn dispatch_chat(
                 &state.config,
                 &state.registry,
                 &state.credentials,
+                &state.usage_cache,
                 mixer_model,
                 requires_images,
                 &excluded,
@@ -639,11 +646,7 @@ mod tests {
             "Stub"
         }
         fn models(&self) -> Vec<ModelInfo> {
-            vec![ModelInfo {
-                id: "m",
-                display_name: "M",
-                supports_images: false,
-            }]
+            vec![ModelInfo::new("m", "M", false)]
         }
         fn auth_kind(&self) -> AuthKind {
             AuthKind::ApiKey
@@ -702,6 +705,7 @@ mod tests {
             registry: Arc::new(registry),
             credentials: Arc::new(credentials),
             concurrency,
+            usage_cache: UsageCache::default(),
             pinned_model: None,
         }
     }
@@ -861,11 +865,7 @@ mod tests {
                 self.id
             }
             fn models(&self) -> Vec<ModelInfo> {
-                vec![ModelInfo {
-                    id: "m",
-                    display_name: "M",
-                    supports_images: false,
-                }]
+                vec![ModelInfo::new("m", "M", false)]
             }
             fn auth_kind(&self) -> AuthKind {
                 AuthKind::ApiKey
@@ -949,6 +949,7 @@ mod tests {
                 registry: Arc::new(registry),
                 credentials: Arc::new(credentials),
                 concurrency,
+                usage_cache: UsageCache::default(),
                 pinned_model: None,
             }
         }

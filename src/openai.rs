@@ -294,27 +294,34 @@ fn merge_usage(existing: Option<Value>, incoming: Value) -> Value {
 /// subsequent fragments extend `function.arguments` character by character.
 /// Without this merge, a non-streaming client would only see the final
 /// fragment and receive a truncated arguments JSON.
+///
+/// Uses an `index → position` map so the merge stays O(n) in the total number
+/// of fragments instead of O(n²) — matters for agent loops that dispatch many
+/// parallel tool calls in a single response.
 fn merge_tool_call_deltas(accumulated: &mut Vec<Value>, incoming: Value) {
     let Value::Array(incoming_arr) = incoming else {
         return;
     };
+
+    fn read_index(v: &Value) -> Option<u64> {
+        v.as_object().and_then(|obj| obj.get("index"))?.as_u64()
+    }
+
+    let mut index_to_pos: std::collections::HashMap<u64, usize> = accumulated
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, v)| read_index(v).map(|idx| (idx, pos)))
+        .collect();
+
     for item in incoming_arr {
-        let existing_pos = item
-            .as_object()
-            .and_then(|obj| obj.get("index"))
-            .and_then(Value::as_u64)
-            .and_then(|idx| {
-                accumulated.iter().position(|existing| {
-                    existing
-                        .as_object()
-                        .and_then(|obj| obj.get("index"))
-                        .and_then(Value::as_u64)
-                        == Some(idx)
-                })
-            });
-        match existing_pos {
+        match read_index(&item).and_then(|idx| index_to_pos.get(&idx).copied()) {
             Some(pos) => merge_tool_call_into(&mut accumulated[pos], item),
-            None => accumulated.push(item),
+            None => {
+                if let Some(idx) = read_index(&item) {
+                    index_to_pos.insert(idx, accumulated.len());
+                }
+                accumulated.push(item);
+            }
         }
     }
 }

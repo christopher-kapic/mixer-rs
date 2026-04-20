@@ -71,16 +71,8 @@ impl Provider for CodexProvider {
 
     fn models(&self) -> Vec<ModelInfo> {
         vec![
-            ModelInfo {
-                id: "gpt-5.2",
-                display_name: "GPT-5.2",
-                supports_images: true,
-            },
-            ModelInfo {
-                id: "gpt-5.2-mini",
-                display_name: "GPT-5.2 mini",
-                supports_images: true,
-            },
+            ModelInfo::new("gpt-5.2", "GPT-5.2", true),
+            ModelInfo::new("gpt-5.2-mini", "GPT-5.2 mini", true),
         ]
     }
 

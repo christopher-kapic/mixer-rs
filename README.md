@@ -26,10 +26,12 @@ cargo install --path .
 mixer init                          # write ~/.config/mixer/config.json
 mixer auth login codex              # + login minimax / glm / opencode
 mixer auth status                   # check who's authenticated
-mixer doctor                        # validate config + backend reachability
+mixer doctor                        # validate config + authenticated backends
 mixer providers list                # provider metadata + usage
 mixer serve                         # http://127.0.0.1:4141
 ```
+
+`mixer doctor` avoids live provider calls by default. To include chat and usage probes against authenticated providers, run it with `MIXER_DOCTOR_LIVE=1`.
 
 Then point your OpenAI-compatible client at `http://127.0.0.1:4141/v1` with `model: "mixer"` (or any other mixer model you've defined). A minimal smoke test:
 

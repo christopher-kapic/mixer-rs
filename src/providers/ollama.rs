@@ -112,6 +112,10 @@ fn entry_to_model_info(entry: OpenAiModelEntry) -> ModelInfo {
         // routing against ollama can configure a vision-capable mixer model
         // that targets other providers.
         false,
+        // Ollama's OpenAI-compat catalogue doesn't surface num_ctx either; a
+        // conservative 8192 default excludes self-hosted models from oversize
+        // prompts rather than routing them and timing out.
+        8192,
     )
 }
 

@@ -95,6 +95,52 @@ pub fn request_has_images(req: &ChatRequest) -> bool {
     })
 }
 
+/// Rough token estimate for routing decisions. Uses the standard ~4-chars/token
+/// heuristic across serialized text content, tool definitions, and tool_choice.
+/// This is deliberately an overestimate in most cases — routing errs toward
+/// protecting the request from a too-small context window.
+pub fn estimate_input_tokens(req: &ChatRequest) -> u32 {
+    let mut chars: usize = 0;
+    for m in &req.messages {
+        chars = chars.saturating_add(m.role.len()).saturating_add(4);
+        match &m.content {
+            MessageContent::Text(s) => chars = chars.saturating_add(s.len()),
+            MessageContent::Parts(parts) => {
+                for part in parts {
+                    match part {
+                        ContentPart::Text { text } => chars = chars.saturating_add(text.len()),
+                        ContentPart::ImageUrl { .. } => chars = chars.saturating_add(85 * 4),
+                        ContentPart::Other => {}
+                    }
+                }
+            }
+        }
+        if let Some(name) = &m.name {
+            chars = chars.saturating_add(name.len());
+        }
+        if let Some(tc) = &m.tool_calls
+            && let Ok(s) = serde_json::to_string(tc)
+        {
+            chars = chars.saturating_add(s.len());
+        }
+        if let Some(id) = &m.tool_call_id {
+            chars = chars.saturating_add(id.len());
+        }
+    }
+    if let Some(tools) = &req.tools
+        && let Ok(s) = serde_json::to_string(tools)
+    {
+        chars = chars.saturating_add(s.len());
+    }
+    if let Some(tc) = &req.tool_choice
+        && let Ok(s) = serde_json::to_string(tc)
+    {
+        chars = chars.saturating_add(s.len());
+    }
+    let tokens = chars / 4;
+    u32::try_from(tokens).unwrap_or(u32::MAX)
+}
+
 /// Minimal OpenAI-style chat completion response. Providers are free to
 /// return a richer body by shoving extra fields into `extra`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -394,6 +440,88 @@ mod tests {
             serde_json::from_str(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)
                 .unwrap();
         assert!(!request_has_images(&req));
+    }
+
+    #[test]
+    fn estimate_input_tokens_empty_request_is_small() {
+        let req: ChatRequest = serde_json::from_str(r#"{"model":"m","messages":[]}"#).unwrap();
+        assert!(
+            estimate_input_tokens(&req) < 4,
+            "empty request should estimate near zero",
+        );
+    }
+
+    #[test]
+    fn estimate_input_tokens_scales_with_text_length() {
+        let short: ChatRequest =
+            serde_json::from_str(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)
+                .unwrap();
+        let long_text = "a".repeat(4000);
+        let long_json =
+            format!(r#"{{"model":"m","messages":[{{"role":"user","content":"{long_text}"}}]}}"#);
+        let long: ChatRequest = serde_json::from_str(&long_json).unwrap();
+
+        let short_est = estimate_input_tokens(&short);
+        let long_est = estimate_input_tokens(&long);
+        assert!(
+            long_est > short_est + 900,
+            "4000 extra chars should add ~1000 tokens (chars/4): short={short_est}, long={long_est}",
+        );
+    }
+
+    #[test]
+    fn estimate_input_tokens_counts_images() {
+        let req: ChatRequest = serde_json::from_str(
+            r#"{
+                "model":"m",
+                "messages":[{
+                    "role":"user",
+                    "content":[
+                        {"type":"text","text":""},
+                        {"type":"image_url","image_url":{"url":"x"}}
+                    ]
+                }]
+            }"#,
+        )
+        .unwrap();
+        let baseline: ChatRequest = serde_json::from_str(
+            r#"{
+                "model":"m",
+                "messages":[{
+                    "role":"user",
+                    "content":[
+                        {"type":"text","text":""}
+                    ]
+                }]
+            }"#,
+        )
+        .unwrap();
+        let delta = estimate_input_tokens(&req) - estimate_input_tokens(&baseline);
+        assert!(
+            delta >= 85,
+            "image part should contribute at least 85 tokens, got {delta}",
+        );
+    }
+
+    #[test]
+    fn estimate_input_tokens_accounts_for_tools() {
+        let without: ChatRequest =
+            serde_json::from_str(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)
+                .unwrap();
+        let with_tools: ChatRequest = serde_json::from_str(
+            r#"{
+                "model":"m",
+                "messages":[{"role":"user","content":"hi"}],
+                "tools":[
+                    {"type":"function","function":{"name":"get_weather","description":"Fetch current weather for a city by name, returning a structured JSON body","parameters":{"type":"object"}}}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert!(
+            estimate_input_tokens(&with_tools) > estimate_input_tokens(&without) + 10,
+            "tools payload should contribute to the estimate",
+        );
     }
 
     #[test]

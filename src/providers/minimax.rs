@@ -40,8 +40,8 @@ impl Provider for MinimaxProvider {
 
     fn models(&self) -> Vec<ModelInfo> {
         vec![
-            ModelInfo::new("MiniMax-M2", "MiniMax M2", false),
-            ModelInfo::new("MiniMax-M2-vl", "MiniMax M2 (vision)", true),
+            ModelInfo::new("MiniMax-M2", "MiniMax M2", false, 192_000),
+            ModelInfo::new("MiniMax-M2-vl", "MiniMax M2 (vision)", true, 192_000),
         ]
     }
 

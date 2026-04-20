@@ -43,6 +43,9 @@ pub struct ModelInfo {
     pub id: Cow<'static, str>,
     pub display_name: Cow<'static, str>,
     pub supports_images: bool,
+    /// Total context window in tokens (input + output), as the provider
+    /// advertises it. Consumed by the router's context-window exclusion filter.
+    pub context_window: u32,
 }
 
 impl ModelInfo {
@@ -50,11 +53,13 @@ impl ModelInfo {
         id: impl Into<Cow<'static, str>>,
         display_name: impl Into<Cow<'static, str>>,
         supports_images: bool,
+        context_window: u32,
     ) -> Self {
         Self {
             id: id.into(),
             display_name: display_name.into(),
             supports_images,
+            context_window,
         }
     }
 }
@@ -196,5 +201,11 @@ mod tests {
         let r = builtin_registry();
         let err = r.get("not-a-real-provider").err().expect("expected error");
         assert!(err.to_string().contains("unknown provider"));
+    }
+
+    #[test]
+    fn model_info_new_stores_context_window() {
+        let info = ModelInfo::new("x", "X", false, 1024);
+        assert_eq!(info.context_window, 1024);
     }
 }

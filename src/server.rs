@@ -49,7 +49,7 @@ use crate::concurrency::ConcurrencyLimits;
 use crate::config::{Backend, Config, ProviderSettings};
 use crate::credentials::CredentialStore;
 use crate::openai::{
-    ChatRequest, ChatResponse, ModelListEntry, ModelListResponse, request_has_images,
+    self, ChatRequest, ChatResponse, ModelListEntry, ModelListResponse, request_has_images,
 };
 use crate::providers::ChatStream;
 use crate::providers::ProviderRegistry;
@@ -286,6 +286,9 @@ async fn dispatch_chat(
     // `pick_excluding` is there to prevent.
     let sticky_hash = router::compute_sticky_hash(mixer_model, &req, &headers);
 
+    let est_in = openai::estimate_input_tokens(&req);
+    let max_out = req.max_tokens.unwrap_or(0);
+
     // Retry budget = 1 (plan.md §5.2.1). On a retryable failure before any
     // chunk reaches the client, we re-pick from the pool excluding the failed
     // backend. A second failure surfaces. A failure after a chunk has been
@@ -294,26 +297,31 @@ async fn dispatch_chat(
     let mut excluded: Vec<Backend> = Vec::new();
     let mut last_err: Option<AppError> = None;
 
+    let ctx = router::RoutingContext {
+        config: &state.config,
+        registry: &state.registry,
+        credentials: &state.credentials,
+        usage_cache: &state.usage_cache,
+    };
+
     for attempt in 1..=2u8 {
         let pick_result = if excluded.is_empty() {
             router::pick(
-                &state.config,
-                &state.registry,
-                &state.credentials,
-                &state.usage_cache,
+                &ctx,
                 mixer_model,
                 requires_images,
+                est_in,
+                max_out,
                 sticky_hash,
             )
             .await
         } else {
             router::pick_excluding(
-                &state.config,
-                &state.registry,
-                &state.credentials,
-                &state.usage_cache,
+                &ctx,
                 mixer_model,
                 requires_images,
+                est_in,
+                max_out,
                 &excluded,
                 sticky_hash,
             )
@@ -646,7 +654,7 @@ mod tests {
             "Stub"
         }
         fn models(&self) -> Vec<ModelInfo> {
-            vec![ModelInfo::new("m", "M", false)]
+            vec![ModelInfo::new("m", "M", false, 100_000)]
         }
         fn auth_kind(&self) -> AuthKind {
             AuthKind::ApiKey
@@ -865,7 +873,7 @@ mod tests {
                 self.id
             }
             fn models(&self) -> Vec<ModelInfo> {
-                vec![ModelInfo::new("m", "M", false)]
+                vec![ModelInfo::new("m", "M", false, 100_000)]
             }
             fn auth_kind(&self) -> AuthKind {
                 AuthKind::ApiKey

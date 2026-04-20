@@ -71,8 +71,8 @@ impl Provider for CodexProvider {
 
     fn models(&self) -> Vec<ModelInfo> {
         vec![
-            ModelInfo::new("gpt-5.2", "GPT-5.2", true),
-            ModelInfo::new("gpt-5.2-mini", "GPT-5.2 mini", true),
+            ModelInfo::new("gpt-5.2", "GPT-5.2", true, 400_000),
+            ModelInfo::new("gpt-5.2-mini", "GPT-5.2 mini", true, 400_000),
         ]
     }
 

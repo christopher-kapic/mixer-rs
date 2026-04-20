@@ -39,23 +39,28 @@ pub struct RouteDecision {
     pub provider_model: String,
 }
 
+pub struct RoutingContext<'a> {
+    pub config: &'a Config,
+    pub registry: &'a ProviderRegistry,
+    pub credentials: &'a CredentialStore,
+    pub usage_cache: &'a UsageCache,
+}
+
 /// Pick a backend for the given mixer model + request characteristics.
 pub async fn pick(
-    config: &Config,
-    registry: &ProviderRegistry,
-    credentials: &CredentialStore,
-    usage_cache: &UsageCache,
+    ctx: &RoutingContext<'_>,
     mixer_model: &MixerModel,
     requires_images: bool,
+    est_in: u32,
+    max_out: u32,
     sticky_hash: Option<u64>,
 ) -> Result<RouteDecision> {
     pick_excluding(
-        config,
-        registry,
-        credentials,
-        usage_cache,
+        ctx,
         mixer_model,
         requires_images,
+        est_in,
+        max_out,
         &[],
         sticky_hash,
     )
@@ -67,21 +72,22 @@ pub async fn pick(
 /// retryable error, we re-pick from the same mixer model's pool excluding the
 /// backend that just failed.
 pub async fn pick_excluding(
-    config: &Config,
-    registry: &ProviderRegistry,
-    credentials: &CredentialStore,
-    usage_cache: &UsageCache,
+    ctx: &RoutingContext<'_>,
     mixer_model: &MixerModel,
     requires_images: bool,
+    est_in: u32,
+    max_out: u32,
     excluded: &[Backend],
     sticky_hash: Option<u64>,
 ) -> Result<RouteDecision> {
     let mut candidates = filter_candidates(
-        config,
-        registry,
-        credentials,
+        ctx.config,
+        ctx.registry,
+        ctx.credentials,
         &mixer_model.backends,
         requires_images,
+        est_in,
+        max_out,
     );
     if !excluded.is_empty() {
         candidates.retain(|b| {
@@ -97,9 +103,10 @@ pub async fn pick_excluding(
                 "no eligible backends for this request (try `mixer providers list` \
 to see which providers are authenticated{}",
                 if requires_images {
-                    "; the request has images so only vision-capable models qualify)"
+                    "; the request has images so only vision-capable models qualify, \
+or the prompt may exceed every backend's context window)"
                 } else {
-                    ")"
+                    "; or the prompt may exceed every backend's context window)"
                 }
             );
         }
@@ -118,11 +125,22 @@ to see which providers are authenticated{}",
     } else {
         match mixer_model.strategy {
             RoutingStrategy::Random => uniform_pick(candidates.len()),
-            RoutingStrategy::Weighted => weighted_pick(&candidates, |b| {
-                *mixer_model.weights.get(&b.provider).unwrap_or(&1.0)
-            })?,
+            RoutingStrategy::Weighted => {
+                let counts = same_provider_counts(&candidates);
+                weighted_pick(&candidates, |b| {
+                    let w = *mixer_model.weights.get(&b.provider).unwrap_or(&1.0);
+                    w / counts.get(&b.provider).copied().unwrap_or(1).max(1) as f64
+                })?
+            }
             RoutingStrategy::UsageAware => {
-                usage_aware_pick(config, registry, credentials, usage_cache, &candidates).await?
+                usage_aware_pick(
+                    ctx.config,
+                    ctx.registry,
+                    ctx.credentials,
+                    ctx.usage_cache,
+                    &candidates,
+                )
+                .await?
             }
         }
     };
@@ -238,7 +256,10 @@ fn filter_candidates<'a>(
     credentials: &'a CredentialStore,
     backends: &'a [Backend],
     requires_images: bool,
+    est_in: u32,
+    max_out: u32,
 ) -> Vec<&'a Backend> {
+    let budget = est_in.saturating_add(max_out);
     backends
         .iter()
         .filter(|b| {
@@ -258,16 +279,16 @@ fn filter_candidates<'a>(
             if !provider.is_authenticated(credentials, &settings) {
                 return false;
             }
-            if requires_images {
-                let supports = provider
-                    .models()
-                    .into_iter()
-                    .find(|m| m.id == b.model)
-                    .map(|m| m.supports_images)
-                    .unwrap_or(false);
-                if !supports {
-                    return false;
-                }
+            let Some(model) = provider.models().into_iter().find(|m| m.id == b.model) else {
+                return !requires_images;
+            };
+            if requires_images && !model.supports_images {
+                return false;
+            }
+            // 80% threshold via integer math: ctx * 4 / 5 avoids f64 rounding.
+            let allowed = (model.context_window as u64 * 4) / 5;
+            if (budget as u64) > allowed {
+                return false;
             }
             true
         })
@@ -276,6 +297,19 @@ fn filter_candidates<'a>(
 
 fn uniform_pick(len: usize) -> usize {
     rand::thread_rng().gen_range(0..len)
+}
+
+/// Count how many backends in the filtered pool share each provider id.
+/// Used to normalize weighted/usage-aware picks so that listing N models from
+/// the same provider doesn't give that provider N× the slot share — weights
+/// and usage snapshots are provider-scoped, and this division keeps the
+/// intuitive "one slot per provider per pick" semantics.
+fn same_provider_counts(candidates: &[&Backend]) -> std::collections::HashMap<String, usize> {
+    let mut counts = std::collections::HashMap::new();
+    for b in candidates {
+        *counts.entry(b.provider.clone()).or_insert(0usize) += 1;
+    }
+    counts
 }
 
 fn weighted_pick<F>(candidates: &[&Backend], weight_of: F) -> Result<usize>
@@ -322,6 +356,7 @@ async fn usage_aware_pick(
     usage_cache: &UsageCache,
     candidates: &[&Backend],
 ) -> Result<usize> {
+    let counts = same_provider_counts(candidates);
     let mut weights = Vec::with_capacity(candidates.len());
     for b in candidates {
         let settings = config
@@ -353,7 +388,8 @@ async fn usage_aware_pick(
             }
             Err(_) => 0.0,
         };
-        weights.push(w);
+        let n = counts.get(&b.provider).copied().unwrap_or(1).max(1) as f64;
+        weights.push(w / n);
     }
     weighted_index(&weights)
 }
@@ -368,6 +404,74 @@ mod tests {
     #[test]
     fn weighted_index_empty_errors() {
         assert!(weighted_index(&[]).is_err());
+    }
+
+    #[test]
+    fn same_provider_counts_tallies_each_provider() {
+        let a1 = Backend {
+            provider: "a".to_string(),
+            model: "m1".to_string(),
+        };
+        let a2 = Backend {
+            provider: "a".to_string(),
+            model: "m2".to_string(),
+        };
+        let b = Backend {
+            provider: "b".to_string(),
+            model: "m".to_string(),
+        };
+        let pool: Vec<&Backend> = vec![&a1, &a2, &b];
+        let counts = same_provider_counts(&pool);
+        assert_eq!(counts.get("a").copied(), Some(2));
+        assert_eq!(counts.get("b").copied(), Some(1));
+    }
+
+    #[test]
+    fn weighted_pick_normalizes_per_pool_so_extra_models_dont_multiply_slot_share() {
+        // Two providers with equal weight 1.0; provider "a" has two models in
+        // the pool, "b" has one. Without normalization the split would be 2:1
+        // in a's favour. With normalization it should be ~1:1 between
+        // providers (each a-model gets half of a's slot, so a total is still
+        // 1.0 vs b's 1.0).
+        let a1 = Backend {
+            provider: "a".to_string(),
+            model: "m1".to_string(),
+        };
+        let a2 = Backend {
+            provider: "a".to_string(),
+            model: "m2".to_string(),
+        };
+        let b = Backend {
+            provider: "b".to_string(),
+            model: "m".to_string(),
+        };
+        let pool: Vec<&Backend> = vec![&a1, &a2, &b];
+        let counts = same_provider_counts(&pool);
+
+        let mut weights_per_provider = HashMap::new();
+        weights_per_provider.insert("a".to_string(), 1.0_f64);
+        weights_per_provider.insert("b".to_string(), 1.0_f64);
+
+        let mut hits_a = 0usize;
+        let mut hits_b = 0usize;
+        for _ in 0..4000 {
+            let idx = weighted_pick(&pool, |back| {
+                let w = *weights_per_provider.get(&back.provider).unwrap_or(&1.0);
+                w / counts.get(&back.provider).copied().unwrap_or(1).max(1) as f64
+            })
+            .unwrap();
+            match pool[idx].provider.as_str() {
+                "a" => hits_a += 1,
+                "b" => hits_b += 1,
+                _ => unreachable!(),
+            }
+        }
+        // Within a 10% tolerance of 50/50.
+        let ratio = hits_a as f64 / (hits_a + hits_b) as f64;
+        assert!(
+            (0.4..=0.6).contains(&ratio),
+            "expected ~50/50 provider split after normalization, got a={hits_a} b={hits_b}",
+        );
     }
 
     #[test]
@@ -639,7 +743,7 @@ mod tests {
                 self.0
             }
             fn models(&self) -> Vec<ModelInfo> {
-                vec![ModelInfo::new("m", "M", false)]
+                vec![ModelInfo::new("m", "M", false, 100_000)]
             }
             fn auth_kind(&self) -> AuthKind {
                 AuthKind::ApiKey
@@ -718,25 +822,198 @@ mod tests {
         );
 
         let usage_cache = UsageCache::default();
+        let ctx = RoutingContext {
+            config: &config,
+            registry: &registry,
+            credentials: &store,
+            usage_cache: &usage_cache,
+        };
         let mut seen = std::collections::HashSet::new();
         for _ in 0..10 {
-            let decision = pick(
-                &config,
-                &registry,
-                &store,
-                &usage_cache,
-                &mixer_model,
-                false,
-                sticky_hash,
-            )
-            .await
-            .expect("pick should succeed");
+            let decision = pick(&ctx, &mixer_model, false, 0, 0, sticky_hash)
+                .await
+                .expect("pick should succeed");
             seen.insert((decision.provider_id, decision.provider_model));
         }
         assert_eq!(
             seen.len(),
             1,
             "ten sticky picks with the same hash must pin to exactly one backend, got {seen:?}",
+        );
+    }
+
+    // Generalised test provider: reports a configurable per-model catalogue so
+    // router-level tests can vary `supports_images` and `context_window`
+    // without touching production providers.
+    struct TestProvider {
+        id: &'static str,
+        models: Vec<crate::providers::ModelInfo>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::Provider for TestProvider {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn display_name(&self) -> &'static str {
+            self.id
+        }
+        fn models(&self) -> Vec<crate::providers::ModelInfo> {
+            self.models.clone()
+        }
+        fn auth_kind(&self) -> crate::providers::AuthKind {
+            crate::providers::AuthKind::ApiKey
+        }
+        fn is_authenticated(
+            &self,
+            _store: &CredentialStore,
+            _settings: &crate::config::ProviderSettings,
+        ) -> bool {
+            true
+        }
+        async fn login(&self, _store: &CredentialStore) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn chat_completion(
+            &self,
+            _store: &CredentialStore,
+            _settings: &crate::config::ProviderSettings,
+            _req: ChatRequest,
+        ) -> anyhow::Result<crate::providers::ChatStream> {
+            unreachable!("router tests never dispatch")
+        }
+    }
+
+    fn build_ctx_and_model(
+        entries: &[(&'static str, &'static str, bool, u32)],
+    ) -> (
+        Config,
+        ProviderRegistry,
+        CredentialStore,
+        MixerModel,
+        tempfile::TempDir,
+    ) {
+        use crate::providers::ModelInfo;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let mut registry = ProviderRegistry::new();
+        let mut backends = Vec::new();
+        let mut config = Config::default();
+        config.providers.clear();
+
+        for (provider_id, model_id, supports_images, context_window) in entries {
+            registry.register(Arc::new(TestProvider {
+                id: provider_id,
+                models: vec![ModelInfo::new(
+                    *model_id,
+                    *model_id,
+                    *supports_images,
+                    *context_window,
+                )],
+            }));
+            backends.push(Backend {
+                provider: (*provider_id).to_string(),
+                model: (*model_id).to_string(),
+            });
+            config.providers.insert(
+                (*provider_id).to_string(),
+                crate::config::ProviderSettings::default_enabled(),
+            );
+        }
+
+        let mixer_model = MixerModel {
+            description: String::new(),
+            backends,
+            strategy: RoutingStrategy::Random,
+            weights: HashMap::new(),
+            sticky: None,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let store = CredentialStore::with_dir_for_tests(tmp.path().to_path_buf());
+        (config, registry, store, mixer_model, tmp)
+    }
+
+    // Invariant: an image-bearing request must never land on a text-only
+    // backend when vision-capable backends exist in the same pool.
+    #[tokio::test]
+    async fn pick_excludes_text_only_backends_for_image_requests() {
+        let (config, registry, store, mixer_model, _tmp) = build_ctx_and_model(&[
+            ("vision_a", "m", true, 200_000),
+            ("vision_b", "m", true, 200_000),
+            ("text_a", "m", false, 200_000),
+            ("text_b", "m", false, 200_000),
+        ]);
+        let usage_cache = UsageCache::default();
+        let ctx = RoutingContext {
+            config: &config,
+            registry: &registry,
+            credentials: &store,
+            usage_cache: &usage_cache,
+        };
+        for _ in 0..50 {
+            let decision = pick(&ctx, &mixer_model, true, 100, 100, None)
+                .await
+                .expect("pick should succeed");
+            assert!(
+                matches!(decision.provider_id.as_str(), "vision_a" | "vision_b"),
+                "image request routed to non-vision backend: {}",
+                decision.provider_id,
+            );
+        }
+    }
+
+    // Invariant: backends whose 80% context threshold can't cover
+    // est_in + max_out are filtered out.
+    #[tokio::test]
+    async fn pick_excludes_too_small_context_windows() {
+        let (config, registry, store, mixer_model, _tmp) = build_ctx_and_model(&[
+            ("small", "m", false, 8_000),
+            ("medium", "m", false, 50_000),
+            ("large", "m", false, 400_000),
+        ]);
+        let usage_cache = UsageCache::default();
+        let ctx = RoutingContext {
+            config: &config,
+            registry: &registry,
+            credentials: &store,
+            usage_cache: &usage_cache,
+        };
+        for _ in 0..50 {
+            let decision = pick(&ctx, &mixer_model, false, 40_000, 1_000, None)
+                .await
+                .expect("pick should succeed");
+            assert_eq!(
+                decision.provider_id, "large",
+                "budget 41000 must only fit in `large` (allowed=320000); got {}",
+                decision.provider_id,
+            );
+        }
+    }
+
+    // Invariant: when every backend's context budget is too small we bail
+    // with an error that mentions the context-window cause.
+    #[tokio::test]
+    async fn pick_bails_when_every_backend_is_too_small() {
+        let (config, registry, store, mixer_model, _tmp) = build_ctx_and_model(&[
+            ("small_a", "m", false, 4_000),
+            ("small_b", "m", false, 4_000),
+        ]);
+        let usage_cache = UsageCache::default();
+        let ctx = RoutingContext {
+            config: &config,
+            registry: &registry,
+            credentials: &store,
+            usage_cache: &usage_cache,
+        };
+        let err = pick(&ctx, &mixer_model, false, 100_000, 0, None)
+            .await
+            .expect_err("pick should fail when every backend is undersized");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("context window"),
+            "error should mention the context-window cause, got: {msg}",
         );
     }
 

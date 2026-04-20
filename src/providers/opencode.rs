@@ -48,8 +48,9 @@ impl Provider for OpencodeProvider {
                 "anthropic/claude-sonnet-4-6",
                 "Claude Sonnet 4.6 (via opencode)",
                 true,
+                1_000_000,
             ),
-            ModelInfo::new("openai/gpt-5.2", "GPT-5.2 (via opencode)", true),
+            ModelInfo::new("openai/gpt-5.2", "GPT-5.2 (via opencode)", true, 400_000),
         ]
     }
 

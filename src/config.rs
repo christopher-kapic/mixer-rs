@@ -221,6 +221,10 @@ impl Default for Config {
                         provider: "opencode".to_string(),
                         model: "anthropic/claude-sonnet-4-6".to_string(),
                     },
+                    Backend {
+                        provider: "kimi-code".to_string(),
+                        model: "kimi-k2.6".to_string(),
+                    },
                 ],
                 strategy: RoutingStrategy::Random,
                 weights: HashMap::new(),
@@ -229,9 +233,19 @@ impl Default for Config {
         );
 
         let mut providers = HashMap::new();
-        for id in ["codex", "minimax", "glm", "opencode"] {
+        for id in ["codex", "minimax", "glm", "opencode", "kimi-code"] {
             providers.insert(id.to_string(), ProviderSettings::default_enabled());
         }
+        // `kimi-api` is the pay-per-token backup to `kimi-code`. Off by
+        // default so the subscription path is the advertised one; users flip
+        // `enabled` if they want to add pay-per-token Kimi to their pool.
+        providers.insert(
+            "kimi-api".to_string(),
+            ProviderSettings {
+                enabled: false,
+                ..ProviderSettings::default_enabled()
+            },
+        );
         // Self-hosted ollama is opt-in: disabled by default, with a sensible
         // concurrency cap for GPU-constrained hosts. Users flip `enabled` once
         // they have a local ollama server running.
@@ -333,7 +347,7 @@ mod tests {
     #[test]
     fn default_enables_subscription_providers() {
         let c = Config::default();
-        for id in ["codex", "minimax", "glm", "opencode"] {
+        for id in ["codex", "minimax", "glm", "opencode", "kimi-code"] {
             let s = c
                 .providers
                 .get(id)
@@ -344,6 +358,19 @@ mod tests {
                 "{id} should be uncapped by default",
             );
         }
+    }
+
+    #[test]
+    fn default_disables_kimi_api_pay_per_token_path() {
+        let c = Config::default();
+        let kimi_api = c
+            .providers
+            .get("kimi-api")
+            .expect("kimi-api should be in default providers map");
+        assert!(
+            !kimi_api.enabled,
+            "kimi-api is opt-in (backup to kimi-code)"
+        );
     }
 
     #[test]

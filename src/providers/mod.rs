@@ -9,6 +9,8 @@
 pub mod codex;
 pub mod common;
 pub mod glm;
+pub mod kimi_api;
+pub mod kimi_code;
 pub mod minimax;
 pub mod ollama;
 pub mod opencode;
@@ -181,6 +183,8 @@ pub fn builtin_registry() -> ProviderRegistry {
     r.register(Arc::new(minimax::MinimaxProvider));
     r.register(Arc::new(glm::GlmProvider));
     r.register(Arc::new(opencode::OpencodeProvider));
+    r.register(Arc::new(kimi_code::KimiCodeProvider));
+    r.register(Arc::new(kimi_api::KimiApiProvider));
     r.register(Arc::new(ollama::OllamaProvider));
     r
 }
@@ -193,7 +197,18 @@ mod tests {
     fn builtin_registry_has_all_providers() {
         let r = builtin_registry();
         let ids = r.ids();
-        assert_eq!(ids, vec!["codex", "glm", "minimax", "ollama", "opencode"]);
+        assert_eq!(
+            ids,
+            vec![
+                "codex",
+                "glm",
+                "kimi-api",
+                "kimi-code",
+                "minimax",
+                "ollama",
+                "opencode",
+            ],
+        );
     }
 
     #[test]

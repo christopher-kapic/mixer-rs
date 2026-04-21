@@ -28,6 +28,14 @@ pub struct ChatRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
 
+    /// OpenAI-Chat-Completions renamed `max_tokens` to `max_completion_tokens`;
+    /// modern SDKs send the latter. Mixer accepts both, prefers
+    /// `max_completion_tokens` when present (see
+    /// [`ChatRequest::resolved_max_tokens`]), and forwards whichever field(s)
+    /// the client sent so the upstream sees the exact shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<u32>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Value>,
 
@@ -95,6 +103,16 @@ pub struct ImageUrl {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+impl ChatRequest {
+    /// Resolve the effective output-token budget, preferring the newer
+    /// `max_completion_tokens` field when both are present. Used by the
+    /// context-window filter and the Responses API translator so a modern
+    /// client that only sends `max_completion_tokens` is honored correctly.
+    pub fn resolved_max_tokens(&self) -> Option<u32> {
+        self.max_completion_tokens.or(self.max_tokens)
+    }
 }
 
 /// Returns true if any message in the request carries an image part.
@@ -463,6 +481,48 @@ mod tests {
             serde_json::from_str(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)
                 .unwrap();
         assert!(!request_has_images(&req));
+    }
+
+    #[test]
+    fn resolved_max_tokens_prefers_max_completion_tokens() {
+        let only_max_tokens: ChatRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":512}"#,
+        )
+        .unwrap();
+        assert_eq!(only_max_tokens.resolved_max_tokens(), Some(512));
+
+        let only_new: ChatRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":1024}"#,
+        )
+        .unwrap();
+        assert_eq!(only_new.resolved_max_tokens(), Some(1024));
+
+        // Both present — prefer the newer field.
+        let both: ChatRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":512,"max_completion_tokens":1024}"#,
+        )
+        .unwrap();
+        assert_eq!(both.resolved_max_tokens(), Some(1024));
+
+        let neither: ChatRequest =
+            serde_json::from_str(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)
+                .unwrap();
+        assert_eq!(neither.resolved_max_tokens(), None);
+    }
+
+    #[test]
+    fn max_completion_tokens_round_trips_without_landing_in_extra() {
+        let req: ChatRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":256}"#,
+        )
+        .unwrap();
+        assert_eq!(req.max_completion_tokens, Some(256));
+        // The pass-through catch-all must not also capture the field we now
+        // parse explicitly — otherwise we'd double-serialise it when
+        // forwarding to an upstream.
+        assert!(!req.extra.contains_key("max_completion_tokens"));
+        let back = serde_json::to_value(&req).unwrap();
+        assert_eq!(back["max_completion_tokens"], 256);
     }
 
     #[test]

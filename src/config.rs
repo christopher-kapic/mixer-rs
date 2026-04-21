@@ -154,7 +154,15 @@ pub enum RoutingStrategy {
 }
 
 /// Non-secret, per-provider settings.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+///
+/// Note the hand-written [`Default`] impl: a provider entry missing from the
+/// config map must behave the same as one that parsed with all fields at their
+/// serde defaults. That means `enabled: true` (matching `default_true()` on
+/// the field below). The `#[derive(Default)]` that used to live here produced
+/// `enabled: false` — routing and `mixer providers list` disagreed on whether
+/// a missing entry was enabled, so sparse configs silently behaved
+/// inconsistently.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderSettings {
     /// When false, the provider is skipped even if authenticated.
     #[serde(default = "default_true")]
@@ -268,8 +276,8 @@ impl Default for Config {
     }
 }
 
-impl ProviderSettings {
-    pub fn default_enabled() -> Self {
+impl Default for ProviderSettings {
+    fn default() -> Self {
         Self {
             enabled: true,
             base_url: None,
@@ -277,6 +285,16 @@ impl ProviderSettings {
             request_timeout_secs: None,
             api_key_env: None,
         }
+    }
+}
+
+impl ProviderSettings {
+    /// Retained as a readability alias for the many call sites that build a
+    /// `ProviderSettings` with only a base URL or concurrency cap overridden
+    /// (`..ProviderSettings::default_enabled()`). Equivalent to `Self::default()`
+    /// now that the hand-written [`Default`] impl matches.
+    pub fn default_enabled() -> Self {
+        Self::default()
     }
 }
 
@@ -460,6 +478,26 @@ mod tests {
         let s = m.sticky.expect("sticky should be present");
         assert!(s.enabled);
         assert_eq!(s.key, StickyKey::MessagesHash);
+    }
+
+    #[test]
+    fn provider_settings_default_matches_serde_default() {
+        // A sparse config that mentions a provider by name but omits every
+        // field must deserialise to the same shape as one that never mentions
+        // the provider at all. Both routes previously diverged: the former
+        // flowed through serde (enabled=true via `default_true()`), the
+        // latter through `unwrap_or_default()` (enabled=false via the
+        // auto-derived `Default`). Users saw routing and
+        // `mixer providers list` disagree about whether the provider was
+        // enabled.
+        let parsed: ProviderSettings = serde_json::from_str("{}").unwrap();
+        let explicit = ProviderSettings::default();
+        assert_eq!(parsed, explicit);
+        assert!(
+            ProviderSettings::default().enabled,
+            "a missing provider entry must be treated as enabled so routing and \
+             diagnostics agree on sparse configs",
+        );
     }
 
     #[test]

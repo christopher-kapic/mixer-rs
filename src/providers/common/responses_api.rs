@@ -87,7 +87,7 @@ pub fn chat_request_to_responses_body(req: &ChatRequest, model: &str) -> Value {
     if let Some(tool_choice) = req.tool_choice.as_ref() {
         body.insert("tool_choice".into(), translate_tool_choice(tool_choice));
     }
-    if let Some(max_tokens) = req.max_tokens {
+    if let Some(max_tokens) = req.resolved_max_tokens() {
         body.insert("max_output_tokens".into(), json!(max_tokens));
     }
     if let Some(temperature) = req.temperature {
@@ -647,6 +647,49 @@ mod tests {
         assert_eq!(body["tool_choice"]["type"], "function");
         assert_eq!(body["tool_choice"]["name"], "foo");
         assert!(body["tool_choice"].get("function").is_none());
+    }
+
+    #[test]
+    fn request_maps_max_tokens_to_max_output_tokens() {
+        let req = parse_req(
+            r#"{
+                "model":"m",
+                "messages":[{"role":"user","content":"x"}],
+                "max_tokens":512
+            }"#,
+        );
+        let body = chat_request_to_responses_body(&req, "gpt-5.2");
+        assert_eq!(body["max_output_tokens"], 512);
+    }
+
+    #[test]
+    fn request_maps_max_completion_tokens_to_max_output_tokens() {
+        let req = parse_req(
+            r#"{
+                "model":"m",
+                "messages":[{"role":"user","content":"x"}],
+                "max_completion_tokens":1024
+            }"#,
+        );
+        let body = chat_request_to_responses_body(&req, "gpt-5.2");
+        assert_eq!(
+            body["max_output_tokens"], 1024,
+            "Responses API must honor the modern max_completion_tokens alias",
+        );
+    }
+
+    #[test]
+    fn request_prefers_max_completion_tokens_when_both_are_set() {
+        let req = parse_req(
+            r#"{
+                "model":"m",
+                "messages":[{"role":"user","content":"x"}],
+                "max_tokens":512,
+                "max_completion_tokens":1024
+            }"#,
+        );
+        let body = chat_request_to_responses_body(&req, "gpt-5.2");
+        assert_eq!(body["max_output_tokens"], 1024);
     }
 
     #[test]

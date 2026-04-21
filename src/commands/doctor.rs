@@ -363,6 +363,7 @@ async fn probe_chat(
             temperature: None,
             top_p: None,
             max_tokens: Some(1),
+            max_completion_tokens: None,
             tools: None,
             tool_choice: None,
             extra: Default::default(),

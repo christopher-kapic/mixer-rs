@@ -287,7 +287,7 @@ async fn dispatch_chat(
     let sticky_hash = router::compute_sticky_hash(mixer_model, &req, &headers);
 
     let est_in = openai::estimate_input_tokens(&req);
-    let max_out = req.max_tokens.unwrap_or(0);
+    let max_out = req.resolved_max_tokens().unwrap_or(0);
 
     // Retry budget = 1 (plan.md §5.2.1). On a retryable failure before any
     // chunk reaches the client, we re-pick from the pool excluding the failed
@@ -773,6 +773,7 @@ mod tests {
             temperature: None,
             top_p: None,
             max_tokens: None,
+            max_completion_tokens: None,
             tools: None,
             tool_choice: None,
             extra: Default::default(),

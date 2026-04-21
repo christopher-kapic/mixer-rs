@@ -536,6 +536,7 @@ mod tests {
             temperature: None,
             top_p: None,
             max_tokens: None,
+            max_completion_tokens: None,
             tools: None,
             tool_choice: None,
             extra: Default::default(),

@@ -167,15 +167,9 @@ impl Provider for MinimaxProvider {
         let base = settings.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
         let url = format!("{}{MODELS_PATH}", base.trim_end_matches('/'));
         let timeout = settings.request_timeout_secs.map(Duration::from_secs);
-        let entries = fetch_openai_models(
-            self.id(),
-            &url,
-            &api_key,
-            AuthScheme::Bearer,
-            timeout,
-            None,
-        )
-        .await?;
+        let entries =
+            fetch_openai_models(self.id(), &url, &api_key, AuthScheme::Bearer, timeout, None)
+                .await?;
         Ok(Some(entries))
     }
 }

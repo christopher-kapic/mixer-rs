@@ -244,16 +244,8 @@ impl Provider for OllamaProvider {
         let base = settings.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
         let url = format!("{}{CHAT_PATH}", base.trim_end_matches('/'));
         let timeout = settings.request_timeout_secs.map(Duration::from_secs);
-        openai_client::chat_completion(
-            self.id(),
-            &url,
-            "",
-            AuthScheme::None,
-            timeout,
-            None,
-            req,
-        )
-        .await
+        openai_client::chat_completion(self.id(), &url, "", AuthScheme::None, timeout, None, req)
+            .await
     }
 
     /// Direct, uncached read of `GET <base_url>/models`. Deliberately bypasses

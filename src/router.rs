@@ -194,11 +194,14 @@ fn hash_messages_prefix(messages: &[ChatMessage]) -> Option<u64> {
     for m in &messages[..end] {
         m.role.hash(&mut hasher);
         match &m.content {
-            MessageContent::Text(s) => {
+            None => {
+                2u8.hash(&mut hasher);
+            }
+            Some(MessageContent::Text(s)) => {
                 0u8.hash(&mut hasher);
                 s.hash(&mut hasher);
             }
-            MessageContent::Parts(parts) => {
+            Some(MessageContent::Parts(parts)) => {
                 1u8.hash(&mut hasher);
                 // Serialize deterministically via serde_json so we capture the
                 // full structure (text + image parts) without reaching into
@@ -498,7 +501,7 @@ mod tests {
     fn user(text: &str) -> ChatMessage {
         ChatMessage {
             role: "user".to_string(),
-            content: MessageContent::Text(text.to_string()),
+            content: Some(MessageContent::Text(text.to_string())),
             name: None,
             tool_calls: None,
             tool_call_id: None,
@@ -508,7 +511,7 @@ mod tests {
     fn assistant(text: &str) -> ChatMessage {
         ChatMessage {
             role: "assistant".to_string(),
-            content: MessageContent::Text(text.to_string()),
+            content: Some(MessageContent::Text(text.to_string())),
             name: None,
             tool_calls: None,
             tool_call_id: None,
@@ -518,7 +521,7 @@ mod tests {
     fn system(text: &str) -> ChatMessage {
         ChatMessage {
             role: "system".to_string(),
-            content: MessageContent::Text(text.to_string()),
+            content: Some(MessageContent::Text(text.to_string())),
             name: None,
             tool_calls: None,
             tool_call_id: None,

@@ -49,6 +49,8 @@ curl http://127.0.0.1:4141/v1/chat/completions \
 | `minimax` | API key | `MiniMax-M2`, `MiniMax-M2-vl` | M2-vl only | yes (Coding Plan, official) | Token Plan users fall back to neutral weight |
 | `glm` | API key | `glm-4.6`, `glm-4.5v` | 4.5v only | **unofficial** | Dashboard-internal endpoint — may break without notice |
 | `opencode` | API key | `anthropic/claude-sonnet-4-6`, … | yes | no | No client-facing quota API as of April 2026 |
+| `kimi-code` | OAuth device flow (Kimi Code subscription) | `kimi-k2.6`, `kimi-k2.5`, `kimi-k2-thinking` | no | no | 5-hour quota window, no public introspection endpoint |
+| `kimi-api` | API key (Moonshot, pay-per-token) | `kimi-k2.6`, `kimi-k2.5`, `kimi-k2-thinking` | no | no | Disabled by default; backup to `kimi-code` |
 | `ollama` | none (self-hosted) | discovered at runtime | per-model | n/a | Disabled by default; `max_concurrent_requests: 2` |
 
 "Usage telemetry: yes" means the `usage-aware` routing strategy has real plan-consumption data to work with. Providers marked "no" (or when any probe fails) fall back to a neutral 0.5 weight so they still participate in routing.
@@ -68,7 +70,8 @@ A *mixer model* is a virtual model name clients request (`model: "mixer"`) that 
         { "provider": "codex", "model": "gpt-5.2" },
         { "provider": "minimax", "model": "MiniMax-M2" },
         { "provider": "glm", "model": "glm-4.6" },
-        { "provider": "opencode", "model": "anthropic/claude-sonnet-4-6" }
+        { "provider": "opencode", "model": "anthropic/claude-sonnet-4-6" },
+        { "provider": "kimi-code", "model": "kimi-k2.6" }
       ]
     },
     "vision": {

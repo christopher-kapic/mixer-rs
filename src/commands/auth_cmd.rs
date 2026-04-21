@@ -113,9 +113,15 @@ struct StatusEntry {
 
 #[derive(Debug, Clone, PartialEq)]
 enum CredentialSource {
-    Env { var: String },
-    File { path: String },
+    Env {
+        var: String,
+    },
+    File {
+        path: String,
+    },
     Missing,
+    /// Provider doesn't authenticate — e.g. self-hosted ollama.
+    NoAuth,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -133,6 +139,13 @@ fn describe_status(
     match provider.auth_kind() {
         AuthKind::ApiKey => describe_api_key(provider.id(), store, settings),
         AuthKind::DeviceFlow => describe_device_flow(provider.id(), store, now),
+        AuthKind::None => StatusEntry {
+            provider_id: provider.id().to_string(),
+            auth_kind: AuthKind::None,
+            source: CredentialSource::NoAuth,
+            authenticated: true,
+            oauth: None,
+        },
     }
 }
 
@@ -232,6 +245,7 @@ fn source_label(source: &CredentialSource) -> String {
         CredentialSource::Env { var } => format!("env:{var}"),
         CredentialSource::File { path } => format!("file:{path}"),
         CredentialSource::Missing => "missing".to_string(),
+        CredentialSource::NoAuth => "none (no auth required)".to_string(),
     }
 }
 
@@ -301,6 +315,9 @@ fn build_status_json(entries: &[StatusEntry]) -> Value {
             }
             CredentialSource::Missing => {
                 obj.insert("source".to_string(), json!("missing"));
+            }
+            CredentialSource::NoAuth => {
+                obj.insert("source".to_string(), json!("none"));
             }
         }
         if let Some(oauth) = &entry.oauth {
@@ -642,6 +659,31 @@ mod tests {
                 .lines()
                 .any(|l| l.contains("opencode") && l.contains("missing")),
             "opencode missing line absent: {rendered}"
+        );
+    }
+
+    #[test]
+    fn no_auth_provider_reports_authenticated_with_none_source() {
+        // Ollama-shaped: AuthKind::None should report authenticated=true with
+        // `source: none` in JSON, matching `providers list --json` which sees
+        // the provider as always authenticated.
+        let entry = StatusEntry {
+            provider_id: "ollama".to_string(),
+            auth_kind: AuthKind::None,
+            source: CredentialSource::NoAuth,
+            authenticated: true,
+            oauth: None,
+        };
+        let v = build_status_json(std::slice::from_ref(&entry));
+        assert_eq!(v["ollama"]["authenticated"], true);
+        assert_eq!(v["ollama"]["source"], "none");
+        assert!(v["ollama"].get("path").is_none());
+        assert!(v["ollama"].get("var").is_none());
+
+        let rendered = render_status_text(std::slice::from_ref(&entry), 0);
+        assert!(
+            rendered.contains("ollama") && rendered.contains("none"),
+            "ollama line should state no-auth: {rendered}",
         );
     }
 }

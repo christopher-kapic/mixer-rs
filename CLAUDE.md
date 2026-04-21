@@ -35,6 +35,8 @@ src/
     minimax.rs          — Minimax (API key)
     glm.rs              — GLM / z.ai (API key)
     opencode.rs         — opencode subscription (API key)
+    kimi_code.rs        — Kimi Code subscription (device flow)
+    kimi_api.rs         — Moonshot Kimi pay-per-token (API key; disabled by default)
     ollama.rs           — Self-hosted ollama (no auth; disabled by default)
   commands/
     mod.rs              — Re-exports

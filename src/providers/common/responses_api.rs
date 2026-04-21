@@ -30,7 +30,7 @@ use serde_json::{Map, Value, json};
 
 use crate::openai::{
     ChatCompletionChunk, ChatDelta, ChatMessage, ChatRequest, ChunkChoice, ContentPart, ImageUrl,
-    MessageContent,
+    MessageContent, TypedContentPart,
 };
 
 // ── Request: Chat Completions → Responses API ─────────────────────────────
@@ -122,14 +122,14 @@ pub fn chat_request_to_responses_body(req: &ChatRequest, model: &str) -> Value {
     Value::Object(body)
 }
 
-fn message_text_only(content: &MessageContent) -> Option<String> {
-    match content {
+fn message_text_only(content: &Option<MessageContent>) -> Option<String> {
+    match content.as_ref()? {
         MessageContent::Text(s) => Some(s.clone()),
         MessageContent::Parts(parts) => {
             let joined: String = parts
                 .iter()
                 .filter_map(|p| match p {
-                    ContentPart::Text { text } => Some(text.as_str()),
+                    ContentPart::Typed(TypedContentPart::Text { text }) => Some(text.as_str()),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -139,7 +139,7 @@ fn message_text_only(content: &MessageContent) -> Option<String> {
     }
 }
 
-fn message_to_input(content: &MessageContent, role: &str) -> Value {
+fn message_to_input(content: &Option<MessageContent>, role: &str) -> Value {
     json!({
         "type": "message",
         "role": role,
@@ -147,17 +147,20 @@ fn message_to_input(content: &MessageContent, role: &str) -> Value {
     })
 }
 
-fn content_to_input_parts(content: &MessageContent) -> Vec<Value> {
+fn content_to_input_parts(content: &Option<MessageContent>) -> Vec<Value> {
     match content {
-        MessageContent::Text(s) => vec![json!({"type": "input_text", "text": s})],
-        MessageContent::Parts(parts) => parts
+        None => Vec::new(),
+        Some(MessageContent::Text(s)) => vec![json!({"type": "input_text", "text": s})],
+        Some(MessageContent::Parts(parts)) => parts
             .iter()
             .filter_map(|p| match p {
-                ContentPart::Text { text } => Some(json!({"type": "input_text", "text": text})),
-                ContentPart::ImageUrl {
+                ContentPart::Typed(TypedContentPart::Text { text }) => {
+                    Some(json!({"type": "input_text", "text": text}))
+                }
+                ContentPart::Typed(TypedContentPart::ImageUrl {
                     image_url: ImageUrl { url, .. },
-                } => Some(json!({"type": "input_image", "image_url": url})),
-                ContentPart::Other => None,
+                }) => Some(json!({"type": "input_image", "image_url": url})),
+                ContentPart::Unknown(_) => None,
             })
             .collect(),
     }
@@ -169,12 +172,13 @@ fn append_assistant(input: &mut Vec<Value>, message: &ChatMessage) {
     // per tool call — matching how the Responses API itself represents
     // assistant output in a transcript.
     let text = match &message.content {
-        MessageContent::Text(s) => (!s.is_empty()).then(|| s.clone()),
-        MessageContent::Parts(parts) => {
+        None => None,
+        Some(MessageContent::Text(s)) => (!s.is_empty()).then(|| s.clone()),
+        Some(MessageContent::Parts(parts)) => {
             let joined: String = parts
                 .iter()
                 .filter_map(|p| match p {
-                    ContentPart::Text { text } => Some(text.as_str()),
+                    ContentPart::Typed(TypedContentPart::Text { text }) => Some(text.as_str()),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -215,11 +219,12 @@ fn append_assistant(input: &mut Vec<Value>, message: &ChatMessage) {
 
 fn tool_message_to_input(message: &ChatMessage) -> Value {
     let output = match &message.content {
-        MessageContent::Text(s) => s.clone(),
-        MessageContent::Parts(parts) => parts
+        None => String::new(),
+        Some(MessageContent::Text(s)) => s.clone(),
+        Some(MessageContent::Parts(parts)) => parts
             .iter()
             .filter_map(|p| match p {
-                ContentPart::Text { text } => Some(text.as_str()),
+                ContentPart::Typed(TypedContentPart::Text { text }) => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()

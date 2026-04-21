@@ -75,6 +75,10 @@ pub enum AuthKind {
     ApiKey,
     /// OAuth device-authorization flow with refreshable access tokens.
     DeviceFlow,
+    /// No authentication — e.g. a self-hosted ollama server reached over the
+    /// local network. `mixer auth` treats these as always authenticated and
+    /// skips credential bookkeeping.
+    None,
 }
 
 #[async_trait]

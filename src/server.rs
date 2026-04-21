@@ -764,7 +764,7 @@ mod tests {
             model: "mixer".to_string(),
             messages: vec![ChatMessage {
                 role: "user".to_string(),
-                content: MessageContent::Text("hi".to_string()),
+                content: Some(MessageContent::Text("hi".to_string())),
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
@@ -793,7 +793,7 @@ mod tests {
         assert_eq!(parsed.model, "m");
         assert_eq!(parsed.choices.len(), 1);
         match &parsed.choices[0].message.content {
-            MessageContent::Text(s) => assert_eq!(s, "hello world"),
+            Some(MessageContent::Text(s)) => assert_eq!(s, "hello world"),
             _ => panic!("expected text content"),
         }
         assert_eq!(parsed.choices[0].finish_reason.as_deref(), Some("stop"));
@@ -1065,7 +1065,7 @@ mod tests {
                 let parsed: ChatResponse = serde_json::from_slice(&bytes).unwrap();
                 assert_eq!(parsed.choices.len(), 1);
                 match &parsed.choices[0].message.content {
-                    MessageContent::Text(s) => assert_eq!(s, "hi"),
+                    Some(MessageContent::Text(s)) => assert_eq!(s, "hi"),
                     _ => panic!("expected text content"),
                 }
                 // Reset stubs for the next iteration.

@@ -209,10 +209,7 @@ impl Provider for OllamaProvider {
     }
 
     fn auth_kind(&self) -> AuthKind {
-        // ollama has no notion of authentication; `ApiKey` is the closest
-        // existing variant and keeps `mixer auth` behaviour predictable —
-        // status/login/logout all treat it as key-based with nothing to save.
-        AuthKind::ApiKey
+        AuthKind::None
     }
 
     fn is_authenticated(&self, _store: &CredentialStore, _settings: &ProviderSettings) -> bool {

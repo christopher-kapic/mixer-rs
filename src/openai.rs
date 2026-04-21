@@ -43,7 +43,12 @@ pub struct ChatRequest {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: MessageContent,
+    /// Null/absent for assistant messages that carry only `tool_calls` — the
+    /// OpenAI spec allows this shape and agent clients routinely send it.
+    /// Always serialised (as `null` when absent) so upstream providers that
+    /// key off the field's presence see what the client actually sent.
+    #[serde(default)]
+    pub content: Option<MessageContent>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -64,18 +69,25 @@ pub enum MessageContent {
     Parts(Vec<ContentPart>),
 }
 
+/// A single content part inside a multimodal message.
+///
+/// Known shapes (`text`, `image_url`) deserialize into typed variants so
+/// routing and the Responses API translator can reason about them. Any other
+/// shape — `input_audio`, future provider-specific part types, malformed
+/// objects — is preserved verbatim as a raw JSON value so it round-trips to
+/// the upstream provider exactly as the client sent it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ContentPart {
+    Typed(TypedContentPart),
+    Unknown(Value),
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ContentPart {
-    Text {
-        text: String,
-    },
-    ImageUrl {
-        image_url: ImageUrl,
-    },
-    /// Anything else (e.g. `input_audio`). Treated as non-image for routing.
-    #[serde(other)]
-    Other,
+pub enum TypedContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -88,10 +100,10 @@ pub struct ImageUrl {
 /// Returns true if any message in the request carries an image part.
 pub fn request_has_images(req: &ChatRequest) -> bool {
     req.messages.iter().any(|m| match &m.content {
-        MessageContent::Text(_) => false,
-        MessageContent::Parts(parts) => parts
+        Some(MessageContent::Parts(parts)) => parts
             .iter()
-            .any(|p| matches!(p, ContentPart::ImageUrl { .. })),
+            .any(|p| matches!(p, ContentPart::Typed(TypedContentPart::ImageUrl { .. }))),
+        _ => false,
     })
 }
 
@@ -104,13 +116,22 @@ pub fn estimate_input_tokens(req: &ChatRequest) -> u32 {
     for m in &req.messages {
         chars = chars.saturating_add(m.role.len()).saturating_add(4);
         match &m.content {
-            MessageContent::Text(s) => chars = chars.saturating_add(s.len()),
-            MessageContent::Parts(parts) => {
+            None => {}
+            Some(MessageContent::Text(s)) => chars = chars.saturating_add(s.len()),
+            Some(MessageContent::Parts(parts)) => {
                 for part in parts {
                     match part {
-                        ContentPart::Text { text } => chars = chars.saturating_add(text.len()),
-                        ContentPart::ImageUrl { .. } => chars = chars.saturating_add(85 * 4),
-                        ContentPart::Other => {}
+                        ContentPart::Typed(TypedContentPart::Text { text }) => {
+                            chars = chars.saturating_add(text.len())
+                        }
+                        ContentPart::Typed(TypedContentPart::ImageUrl { .. }) => {
+                            chars = chars.saturating_add(85 * 4)
+                        }
+                        ContentPart::Unknown(v) => {
+                            if let Ok(s) = serde_json::to_string(v) {
+                                chars = chars.saturating_add(s.len());
+                            }
+                        }
                     }
                 }
             }
@@ -278,7 +299,9 @@ impl ChatResponse {
                         .remove(&idx)
                         .flatten()
                         .unwrap_or_else(|| "assistant".to_string()),
-                    content: MessageContent::Text(contents.remove(&idx).unwrap_or_default()),
+                    content: Some(MessageContent::Text(
+                        contents.remove(&idx).unwrap_or_default(),
+                    )),
                     name: None,
                     tool_calls: tool_calls
                         .remove(&idx)
@@ -608,7 +631,7 @@ mod tests {
         let choice = &resp.choices[0];
         assert_eq!(choice.message.role, "assistant");
         match &choice.message.content {
-            MessageContent::Text(s) => assert_eq!(s, "Hello, world!"),
+            Some(MessageContent::Text(s)) => assert_eq!(s, "Hello, world!"),
             _ => panic!("expected text content"),
         }
         assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
@@ -728,5 +751,84 @@ mod tests {
         let incoming = Value::Null;
         let merged = merge_usage(existing, incoming);
         assert_eq!(merged["prompt_tokens"].as_f64(), Some(5.0));
+    }
+
+    #[test]
+    fn assistant_tool_call_message_with_null_content_deserializes() {
+        let req: ChatRequest = serde_json::from_str(
+            r#"{
+                "model": "m",
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [
+                            {"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+                        ]
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+                ]
+            }"#,
+        )
+        .expect("tool-call transcript with null content must parse");
+        assert_eq!(req.messages.len(), 3);
+        assert!(req.messages[1].content.is_none());
+        assert!(req.messages[1].tool_calls.is_some());
+        // Round-trips — serialisation emits `content: null` so upstream
+        // providers see the exact shape the client sent.
+        let back = serde_json::to_value(&req).unwrap();
+        assert!(back["messages"][1]["content"].is_null());
+    }
+
+    #[test]
+    fn assistant_message_with_missing_content_field_deserializes() {
+        let req: ChatRequest = serde_json::from_str(
+            r#"{
+                "model": "m",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [{"id": "c", "type": "function", "function": {"name": "f", "arguments": "{}"}}]
+                    }
+                ]
+            }"#,
+        )
+        .expect("assistant message with omitted content must parse");
+        assert!(req.messages[0].content.is_none());
+    }
+
+    #[test]
+    fn unknown_content_part_round_trips_verbatim() {
+        let raw = r#"{
+            "model": "m",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}
+                ]
+            }]
+        }"#;
+        let req: ChatRequest = serde_json::from_str(raw).unwrap();
+        let parts = match &req.messages[0].content {
+            Some(MessageContent::Parts(p)) => p,
+            _ => panic!("expected parts"),
+        };
+        assert_eq!(parts.len(), 2);
+        match &parts[1] {
+            ContentPart::Unknown(v) => {
+                assert_eq!(v["type"], "input_audio");
+                assert_eq!(v["input_audio"]["data"], "AAAA");
+                assert_eq!(v["input_audio"]["format"], "wav");
+            }
+            _ => panic!("expected unknown variant for input_audio"),
+        }
+        // Serialisation preserves the original shape instead of collapsing it.
+        let back = serde_json::to_value(&req).unwrap();
+        let out_parts = back["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(out_parts[1]["type"], "input_audio");
+        assert_eq!(out_parts[1]["input_audio"]["data"], "AAAA");
+        assert_eq!(out_parts[1]["input_audio"]["format"], "wav");
     }
 }

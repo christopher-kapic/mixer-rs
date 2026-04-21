@@ -32,7 +32,7 @@ use reqwest::{Client, RequestBuilder, StatusCode, header::CONTENT_TYPE};
 
 use crate::openai::{
     ChatCompletionChunk, ChatDelta, ChatRequest, ChatResponse, ChunkChoice, ContentPart,
-    MessageContent,
+    MessageContent, TypedContentPart,
 };
 use crate::providers::ChatStream;
 use crate::providers::common::oauth_refresh::{AuthenticationError, UpstreamHttpError};
@@ -201,13 +201,13 @@ fn json_response_to_chunk(body: &str) -> Result<ChatCompletionChunk> {
     })
 }
 
-fn message_content_to_text(content: MessageContent) -> Option<String> {
-    let text = match content {
+fn message_content_to_text(content: Option<MessageContent>) -> Option<String> {
+    let text = match content? {
         MessageContent::Text(s) => s,
         MessageContent::Parts(parts) => parts
             .into_iter()
             .filter_map(|p| match p {
-                ContentPart::Text { text } => Some(text),
+                ContentPart::Typed(TypedContentPart::Text { text }) => Some(text),
                 _ => None,
             })
             .collect::<Vec<_>>()

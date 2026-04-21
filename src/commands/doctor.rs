@@ -355,6 +355,7 @@ async fn probe_chat(
             messages: vec![ChatMessage {
                 role: "user".to_string(),
                 content: Some(MessageContent::Text("say 'ok'".to_string())),
+                reasoning_content: None,
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,

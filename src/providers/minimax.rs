@@ -1,8 +1,10 @@
 //! Minimax subscription provider.
 //!
 //! Wire protocol: OpenAI-compatible Chat Completions.
-//! Base URL: `https://api.minimax.chat/v1` (override via
-//! `providers.minimax.base_url` in config).
+//! Base URL: `https://api.minimax.io/v1` (override via
+//! `providers.minimax.base_url` in config). The older `api.minimax.chat` host
+//! rejects current Coding Plan keys with 401; `api.minimax.io` is the host
+//! that actually honors them.
 //! Auth: `Authorization: Bearer <api_key>`.
 //!
 //! Login stores the pasted API key at `~/.config/mixer/credentials/minimax.json`
@@ -27,12 +29,16 @@ use crate::config::ProviderSettings;
 use crate::credentials::CredentialStore;
 use crate::openai::ChatRequest;
 use crate::providers::common::api_key_login::prompt_and_store_api_key;
+use crate::providers::common::models_list::fetch_openai_models;
 use crate::providers::common::openai_client::{self, AuthScheme};
-use crate::providers::{AuthKind, ChatStream, ModelInfo, Provider};
+use crate::providers::{
+    AuthKind, ChatStream, ModelInfo, Provider, ReasoningFormat, RemoteModelEntry,
+};
 use crate::usage::UsageSnapshot;
 
-const DEFAULT_BASE_URL: &str = "https://api.minimax.chat/v1";
+const DEFAULT_BASE_URL: &str = "https://api.minimax.io/v1";
 const CHAT_PATH: &str = "/chat/completions";
+const MODELS_PATH: &str = "/models";
 
 /// Default host for the Coding Plan `remains` endpoint. Minimax serves plan
 /// introspection from `api.minimax.io` rather than the chat host, so we keep
@@ -58,9 +64,42 @@ impl Provider for MinimaxProvider {
     }
 
     fn models(&self) -> Vec<ModelInfo> {
+        // Sourced from Minimax's own OpenAI-compatible API reference. Context
+        // window of 192K is the documented default across the M2-series; the
+        // `-highspeed` variants are same-capability with lower-latency
+        // inference. No vision entries are listed here because Minimax has not
+        // published model-ids for M2-series vision variants — add them when
+        // the upstream confirms.
         vec![
-            ModelInfo::new("MiniMax-M2", "MiniMax M2", false, 192_000),
-            ModelInfo::new("MiniMax-M2-vl", "MiniMax M2 (vision)", true, 192_000),
+            ModelInfo::new("MiniMax-M2.7", "MiniMax M2.7", false, 192_000)
+                .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new(
+                "MiniMax-M2.7-highspeed",
+                "MiniMax M2.7 (highspeed)",
+                false,
+                192_000,
+            )
+            .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new("MiniMax-M2.5", "MiniMax M2.5", false, 192_000)
+                .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new(
+                "MiniMax-M2.5-highspeed",
+                "MiniMax M2.5 (highspeed)",
+                false,
+                192_000,
+            )
+            .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new("MiniMax-M2.1", "MiniMax M2.1", false, 192_000)
+                .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new(
+                "MiniMax-M2.1-highspeed",
+                "MiniMax M2.1 (highspeed)",
+                false,
+                192_000,
+            )
+            .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new("MiniMax-M2", "MiniMax M2", false, 192_000)
+                .with_reasoning(ReasoningFormat::Structured),
         ]
     }
 
@@ -105,8 +144,39 @@ impl Provider for MinimaxProvider {
         let base = settings.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
         let url = format!("{}{CHAT_PATH}", base.trim_end_matches('/'));
         let timeout = settings.request_timeout_secs.map(Duration::from_secs);
-        openai_client::chat_completion(self.id(), &url, &api_key, AuthScheme::Bearer, timeout, req)
-            .await
+        openai_client::chat_completion(
+            self.id(),
+            &url,
+            &api_key,
+            AuthScheme::Bearer,
+            timeout,
+            None,
+            req,
+        )
+        .await
+    }
+
+    async fn list_remote_models(
+        &self,
+        store: &CredentialStore,
+        settings: &ProviderSettings,
+    ) -> Result<Option<Vec<RemoteModelEntry>>> {
+        let api_key = store.load_api_key(self.id(), settings).ok_or_else(|| {
+            anyhow!("minimax is not authenticated; run `mixer auth login minimax`")
+        })?;
+        let base = settings.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
+        let url = format!("{}{MODELS_PATH}", base.trim_end_matches('/'));
+        let timeout = settings.request_timeout_secs.map(Duration::from_secs);
+        let entries = fetch_openai_models(
+            self.id(),
+            &url,
+            &api_key,
+            AuthScheme::Bearer,
+            timeout,
+            None,
+        )
+        .await?;
+        Ok(Some(entries))
     }
 }
 
@@ -150,29 +220,34 @@ async fn fetch_minimax_usage(
 }
 
 /// Translate a Coding Plan `remains` body into a [`UsageSnapshot`]. Picks the
-/// most-consumed bucket across `modelRemains[]` since that's what will rate-
+/// most-consumed bucket across `model_remains[]` since that's what will rate-
 /// limit the user first; for routing we want the provider's tightest
 /// constraint, not an average. Returns `None` when the body shape is
 /// unrecognisable (e.g. Token-Plan response) or no entry carries both counts.
+///
+/// Start/end times are milliseconds since the epoch (observed live against
+/// `api.minimax.io` on 2026-04-21: a 5h window reports `end - start = 18_000_000`).
 fn extract_minimax_usage_snapshot(body: &Value) -> Option<UsageSnapshot> {
-    let models = body.get("modelRemains")?.as_array()?;
+    let models = body.get("model_remains")?.as_array()?;
     let mut worst: Option<(f64, u64)> = None;
     for m in models {
-        let total = m.get("currentIntervalTotalCount").and_then(Value::as_u64)?;
+        let total = m
+            .get("current_interval_total_count")
+            .and_then(Value::as_u64)?;
         if total == 0 {
             continue;
         }
-        let remaining = m
-            .get("currentIntervalRemainingCount")
+        let used_count = m
+            .get("current_interval_usage_count")
             .and_then(Value::as_u64)
             .unwrap_or(0)
             .min(total);
-        let used = (total - remaining) as f64 / total as f64;
+        let used = used_count as f64 / total as f64;
         let window_secs = match (
-            m.get("startTime").and_then(Value::as_i64),
-            m.get("endTime").and_then(Value::as_i64),
+            m.get("start_time").and_then(Value::as_i64),
+            m.get("end_time").and_then(Value::as_i64),
         ) {
-            (Some(s), Some(e)) if e > s => (e - s) as u64,
+            (Some(s), Some(e)) if e > s => ((e - s) / 1000) as u64,
             _ => 0,
         };
         if worst.is_none_or(|(w, _)| used > w) {
@@ -308,6 +383,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_remote_models_sends_bearer_and_parses_entries() {
+        use axum::{
+            Router, body::Body, extract::State, http::HeaderMap, response::Response, routing::get,
+        };
+        use std::sync::Mutex as StdMutex;
+        use tokio::net::TcpListener;
+
+        let tmp = TempDir::new().unwrap();
+        let store = store_in(&tmp);
+        store
+            .save("minimax", &json!({ "api_key": "sk-minimax-list" }))
+            .unwrap();
+
+        struct MockState {
+            captured_auth: StdMutex<Option<String>>,
+        }
+        async fn handler(
+            State(state): State<std::sync::Arc<MockState>>,
+            headers: HeaderMap,
+        ) -> Response {
+            *state.captured_auth.lock().unwrap() = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let body = json!({
+                "object": "list",
+                "data": [
+                    {"id": "MiniMax-M2"},
+                    {"id": "MiniMax-M2-vl"},
+                    {"id": "MiniMax-future-model"}
+                ]
+            })
+            .to_string();
+            Response::builder()
+                .status(200)
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        }
+
+        let state = std::sync::Arc::new(MockState {
+            captured_auth: StdMutex::new(None),
+        });
+        let app = Router::new()
+            .route("/models", get(handler))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let settings = settings_with_base(&format!("http://{addr}"));
+        let entries = MinimaxProvider
+            .list_remote_models(&store, &settings)
+            .await
+            .expect("call succeeds")
+            .expect("provider supports remote listing");
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].id, "MiniMax-M2");
+        assert_eq!(entries[2].id, "MiniMax-future-model");
+        assert_eq!(
+            state.captured_auth.lock().unwrap().as_deref(),
+            Some("Bearer sk-minimax-list"),
+        );
+    }
+
+    #[tokio::test]
+    async fn list_remote_models_errors_without_credentials() {
+        let tmp = TempDir::new().unwrap();
+        let store = store_in(&tmp);
+        let settings = ProviderSettings::default_enabled();
+        let err = MinimaxProvider
+            .list_remote_models(&store, &settings)
+            .await
+            .expect_err("missing api key should error");
+        assert!(err.to_string().contains("not authenticated"));
+    }
+
+    #[tokio::test]
     async fn usage_returns_none_without_credentials() {
         let tmp = TempDir::new().unwrap();
         let store = store_in(&tmp);
@@ -366,20 +522,20 @@ mod tests {
         #[test]
         fn extract_snapshot_picks_highest_used_across_models() {
             let body = json!({
-                "modelRemains": [
+                "model_remains": [
                     {
-                        "modelName": "MiniMax-M2",
-                        "startTime": 1_000_000,
-                        "endTime": 1_018_000, // 18_000s = 5h
-                        "currentIntervalTotalCount": 1000,
-                        "currentIntervalRemainingCount": 900 // 10% used
+                        "model_name": "MiniMax-M2",
+                        "start_time": 1_000_000_000i64,
+                        "end_time": 1_018_000_000i64, // 18_000_000ms = 5h
+                        "current_interval_total_count": 1000,
+                        "current_interval_usage_count": 100 // 10% used
                     },
                     {
-                        "modelName": "MiniMax-M2-vl",
-                        "startTime": 1_000_000,
-                        "endTime": 1_018_000,
-                        "currentIntervalTotalCount": 200,
-                        "currentIntervalRemainingCount": 50 // 75% used — worst
+                        "model_name": "MiniMax-M2-vl",
+                        "start_time": 1_000_000_000i64,
+                        "end_time": 1_018_000_000i64,
+                        "current_interval_total_count": 200,
+                        "current_interval_usage_count": 150 // 75% used — worst
                     }
                 ]
             });
@@ -398,34 +554,34 @@ mod tests {
         #[test]
         fn extract_snapshot_returns_none_when_all_entries_missing_counts() {
             let body = json!({
-                "modelRemains": [
-                    { "modelName": "m" }
+                "model_remains": [
+                    { "model_name": "m" }
                 ]
             });
             assert!(extract_minimax_usage_snapshot(&body).is_none());
         }
 
         #[test]
-        fn extract_snapshot_clamps_remaining_above_total() {
-            // Defensive: a server glitch could emit remaining > total; clamp
-            // rather than underflow the unsigned subtraction.
+        fn extract_snapshot_clamps_usage_above_total() {
+            // Defensive: a server glitch could emit usage > total; clamp to
+            // 100% rather than let fraction_used exceed 1.0.
             let body = json!({
-                "modelRemains": [
+                "model_remains": [
                     {
-                        "currentIntervalTotalCount": 100,
-                        "currentIntervalRemainingCount": 999
+                        "current_interval_total_count": 100,
+                        "current_interval_usage_count": 999
                     }
                 ]
             });
             let snap = extract_minimax_usage_snapshot(&body).expect("snapshot");
-            assert_eq!(snap.fraction_used, Some(0.0));
+            assert_eq!(snap.fraction_used, Some(1.0));
         }
 
         #[test]
         fn extract_snapshot_zero_total_is_skipped() {
             let body = json!({
-                "modelRemains": [
-                    { "currentIntervalTotalCount": 0, "currentIntervalRemainingCount": 0 }
+                "model_remains": [
+                    { "current_interval_total_count": 0, "current_interval_usage_count": 0 }
                 ]
             });
             assert!(extract_minimax_usage_snapshot(&body).is_none());
@@ -497,13 +653,13 @@ mod tests {
                 auth_tokens: StdMutex::new(Vec::new()),
                 status: 200,
                 body: json!({
-                    "modelRemains": [
+                    "model_remains": [
                         {
-                            "modelName": "MiniMax-M2",
-                            "startTime": 1_000_000,
-                            "endTime": 1_018_000,
-                            "currentIntervalTotalCount": 1000,
-                            "currentIntervalRemainingCount": 600
+                            "model_name": "MiniMax-M2",
+                            "start_time": 1_000_000_000i64,
+                            "end_time": 1_018_000_000i64,
+                            "current_interval_total_count": 1000,
+                            "current_interval_usage_count": 400
                         }
                     ]
                 })

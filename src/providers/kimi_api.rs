@@ -25,11 +25,15 @@ use crate::config::ProviderSettings;
 use crate::credentials::CredentialStore;
 use crate::openai::ChatRequest;
 use crate::providers::common::api_key_login::prompt_and_store_api_key;
+use crate::providers::common::models_list::fetch_openai_models;
 use crate::providers::common::openai_client::{self, AuthScheme};
-use crate::providers::{AuthKind, ChatStream, ModelInfo, Provider};
+use crate::providers::{
+    AuthKind, ChatStream, ModelInfo, Provider, ReasoningFormat, RemoteModelEntry,
+};
 
 const DEFAULT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 const CHAT_PATH: &str = "/chat/completions";
+const MODELS_PATH: &str = "/models";
 
 pub struct KimiApiProvider;
 
@@ -44,10 +48,27 @@ impl Provider for KimiApiProvider {
     }
 
     fn models(&self) -> Vec<ModelInfo> {
+        // Sourced from the models.dev central catalogue (which opencode also
+        // builds against). Moonshot's pay-per-token endpoint exposes the
+        // specific K2.x checkpoints; the `kimi-code` subscription gateway is
+        // a sibling provider that only addresses `kimi-for-coding`.
         vec![
-            ModelInfo::new("kimi-k2.6", "Kimi K2.6", false, 256_000),
-            ModelInfo::new("kimi-k2.5", "Kimi K2.5", false, 256_000),
-            ModelInfo::new("kimi-k2-thinking", "Kimi K2 Thinking", false, 256_000),
+            ModelInfo::new(
+                "kimi-k2-0905-preview",
+                "Kimi K2 (0905 preview)",
+                false,
+                256_000,
+            )
+            .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new(
+                "kimi-k2-thinking-turbo",
+                "Kimi K2 Thinking (turbo)",
+                false,
+                256_000,
+            )
+            .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new("kimi-k2-thinking", "Kimi K2 Thinking", false, 256_000)
+                .with_reasoning(ReasoningFormat::Structured),
         ]
     }
 
@@ -78,8 +99,39 @@ impl Provider for KimiApiProvider {
         let base = settings.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
         let url = format!("{}{CHAT_PATH}", base.trim_end_matches('/'));
         let timeout = settings.request_timeout_secs.map(Duration::from_secs);
-        openai_client::chat_completion(self.id(), &url, &api_key, AuthScheme::Bearer, timeout, req)
-            .await
+        openai_client::chat_completion(
+            self.id(),
+            &url,
+            &api_key,
+            AuthScheme::Bearer,
+            timeout,
+            None,
+            req,
+        )
+        .await
+    }
+
+    async fn list_remote_models(
+        &self,
+        store: &CredentialStore,
+        settings: &ProviderSettings,
+    ) -> Result<Option<Vec<RemoteModelEntry>>> {
+        let api_key = store.load_api_key(self.id(), settings).ok_or_else(|| {
+            anyhow!("kimi-api is not authenticated; run `mixer auth login kimi-api`")
+        })?;
+        let base = settings.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
+        let url = format!("{}{MODELS_PATH}", base.trim_end_matches('/'));
+        let timeout = settings.request_timeout_secs.map(Duration::from_secs);
+        let entries = fetch_openai_models(
+            self.id(),
+            &url,
+            &api_key,
+            AuthScheme::Bearer,
+            timeout,
+            None,
+        )
+        .await?;
+        Ok(Some(entries))
     }
 }
 

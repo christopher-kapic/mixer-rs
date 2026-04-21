@@ -40,9 +40,11 @@ use crate::providers::common::oauth_refresh::{AuthenticationError, UpstreamHttpE
 /// How the API key is presented to the upstream.
 #[derive(Debug, Clone, Copy)]
 pub enum AuthScheme {
-    /// `Authorization: Bearer <api_key>`. Used by minimax and glm.
+    /// `Authorization: Bearer <api_key>`. Used by minimax, glm, and opencode.
     Bearer,
-    /// `<header_name>: <api_key>`. Used by opencode (`x-api-key`).
+    /// `<header_name>: <api_key>`. No current provider uses this — kept as an
+    /// extension point for future providers that reject Bearer on some routes.
+    #[allow(dead_code)]
     ApiKeyHeader(&'static str),
     /// Send no authentication header. Used by self-hosted endpoints (ollama).
     None,
@@ -55,12 +57,17 @@ pub enum AuthScheme {
 /// `provider_id` and `provider_display` are used solely to build an
 /// actionable [`AuthenticationError`] when the upstream returns 401; they are
 /// not appended to the URL or sent over the wire.
+///
+/// `user_agent` overrides reqwest's default UA on the outbound request. Only
+/// set by providers whose upstream sniffs the header (e.g. kimi-code gates by
+/// client identity); everyone else passes `None`.
 pub async fn chat_completion(
     provider_id: &str,
     url: &str,
     api_key: &str,
     auth_scheme: AuthScheme,
     timeout: Option<Duration>,
+    user_agent: Option<&str>,
     mut req: ChatRequest,
 ) -> Result<ChatStream> {
     // Always ask the upstream to stream so the returned stream is real; we
@@ -69,15 +76,14 @@ pub async fn chat_completion(
 
     let client = build_http_client(timeout)?;
 
-    let request = apply_auth(
-        client
-            .post(url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream")
-            .json(&req),
-        api_key,
-        auth_scheme,
-    );
+    let mut builder = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "text/event-stream");
+    if let Some(ua) = user_agent {
+        builder = builder.header("User-Agent", ua);
+    }
+    let request = apply_auth(builder.json(&req), api_key, auth_scheme);
 
     let resp = request
         .send()
@@ -183,6 +189,7 @@ fn json_response_to_chunk(body: &str) -> Result<ChatCompletionChunk> {
             delta: ChatDelta {
                 role: Some(c.message.role),
                 content: message_content_to_text(c.message.content),
+                reasoning_content: c.message.reasoning_content,
                 tool_calls: c.message.tool_calls,
                 extra: Default::default(),
             },
@@ -263,6 +270,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sse_tolerates_metadata_only_frames() {
+        // opencode Zen emits a billing footer of the form
+        // `{"choices":[],"cost":"0.00761250"}` after the content frames — no
+        // `id`, no `model`. Such frames must parse (into `extra`) rather than
+        // aborting the stream.
+        let payloads = [
+            r#"{"id":"id-1","model":"m","choices":[{"index":0,"delta":{"content":"x"}}]}"#
+                .to_string(),
+            r#"{"choices":[],"cost":"0.00761250"}"#.to_string(),
+            "[DONE]".to_string(),
+        ];
+        let events = stream::iter(
+            payloads
+                .iter()
+                .map(|p| Ok::<_, anyhow::Error>(sse_event(p)))
+                .collect::<Vec<_>>(),
+        );
+        let chunks = sse_events_to_chunks(events);
+        futures::pin_mut!(chunks);
+        let mut out = Vec::new();
+        while let Some(c) = chunks.next().await {
+            out.push(c.unwrap());
+        }
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out[1].extra.get("cost").and_then(|v| v.as_str()),
+            Some("0.00761250"),
+            "unknown top-level fields land in `extra`",
+        );
+    }
+
+    #[tokio::test]
     async fn sse_done_sentinel_is_filtered_out() {
         let payloads = [
             r#"{"id":"id-1","model":"m","choices":[{"index":0,"delta":{"content":"x"}}]}"#
@@ -340,6 +379,7 @@ mod tests {
             "sk-test",
             AuthScheme::Bearer,
             None,
+            None,
             test_support::sample_request(),
         )
         .await
@@ -381,6 +421,7 @@ mod tests {
             "sk-test",
             AuthScheme::Bearer,
             None,
+            None,
             test_support::sample_request(),
         )
         .await
@@ -409,6 +450,7 @@ mod tests {
             &url,
             "wrong-key",
             AuthScheme::Bearer,
+            None,
             None,
             test_support::sample_request(),
         )
@@ -442,6 +484,7 @@ mod tests {
             "sk-test",
             AuthScheme::Bearer,
             None,
+            None,
             test_support::sample_request(),
         )
         .await;
@@ -469,6 +512,7 @@ mod tests {
             &url,
             "sk-zen",
             AuthScheme::ApiKeyHeader("x-api-key"),
+            None,
             None,
             test_support::sample_request(),
         )

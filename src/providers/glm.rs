@@ -43,7 +43,7 @@ use crate::credentials::CredentialStore;
 use crate::openai::ChatRequest;
 use crate::providers::common::api_key_login::prompt_and_store_api_key;
 use crate::providers::common::openai_client::{self, AuthScheme};
-use crate::providers::{AuthKind, ChatStream, ModelInfo, Provider};
+use crate::providers::{AuthKind, ChatStream, ModelInfo, Provider, ReasoningFormat};
 use crate::usage::UsageSnapshot;
 
 const DEFAULT_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
@@ -72,9 +72,39 @@ impl Provider for GlmProvider {
     }
 
     fn models(&self) -> Vec<ModelInfo> {
+        // Sourced from the models.dev central catalogue (which opencode also
+        // builds against). z.ai does not expose a `/v1/models` endpoint, so
+        // this hardcoded list is the only discovery path. Vision flag is set
+        // for IDs that advertise it in their name (`-v`, `v-turbo`, etc.).
+        // Context windows default to 200K (GLM-5/4.x family advertised size)
+        // except the vision variants, which advertise 64K.
         vec![
-            ModelInfo::new("glm-4.6", "GLM 4.6", false, 200_000),
-            ModelInfo::new("glm-4.5v", "GLM 4.5V", true, 64_000),
+            ModelInfo::new("glm-5.1", "GLM 5.1", false, 200_000)
+                .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new("glm-5", "GLM 5", false, 200_000)
+                .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new("glm-5-turbo", "GLM 5 Turbo", false, 200_000)
+                .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new("glm-5v-turbo", "GLM 5V Turbo (vision)", true, 64_000)
+                .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new("glm-4.7", "GLM 4.7", false, 200_000)
+                .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new("glm-4.7-flashx", "GLM 4.7 FlashX", false, 200_000)
+                .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new("glm-4.6", "GLM 4.6", false, 200_000)
+                .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new("glm-4.6v", "GLM 4.6V (vision)", true, 64_000)
+                .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new("glm-4.5", "GLM 4.5", false, 200_000)
+                .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new("glm-4.5-x", "GLM 4.5 X", false, 200_000)
+                .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new("glm-4.5-air", "GLM 4.5 Air", false, 200_000)
+                .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new("glm-4.5-v", "GLM 4.5 V (vision)", true, 64_000)
+                .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new("glm-for-coding", "GLM for Coding", false, 200_000)
+                .with_reasoning(ReasoningFormat::Structured),
         ]
     }
 
@@ -117,8 +147,16 @@ impl Provider for GlmProvider {
         let base = settings.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
         let url = format!("{}{CHAT_PATH}", base.trim_end_matches('/'));
         let timeout = settings.request_timeout_secs.map(Duration::from_secs);
-        openai_client::chat_completion(self.id(), &url, &api_key, AuthScheme::Bearer, timeout, req)
-            .await
+        openai_client::chat_completion(
+            self.id(),
+            &url,
+            &api_key,
+            AuthScheme::Bearer,
+            timeout,
+            None,
+            req,
+        )
+        .await
     }
 }
 

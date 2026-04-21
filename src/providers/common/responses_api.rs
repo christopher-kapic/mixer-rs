@@ -87,9 +87,6 @@ pub fn chat_request_to_responses_body(req: &ChatRequest, model: &str) -> Value {
     if let Some(tool_choice) = req.tool_choice.as_ref() {
         body.insert("tool_choice".into(), translate_tool_choice(tool_choice));
     }
-    if let Some(max_tokens) = req.resolved_max_tokens() {
-        body.insert("max_output_tokens".into(), json!(max_tokens));
-    }
     if let Some(temperature) = req.temperature {
         body.insert("temperature".into(), json!(temperature));
     }
@@ -357,6 +354,22 @@ where
                     }
                     yield text_chunk(&response_id, &model_name, created, delta);
                 }
+                // Reasoning summaries and raw reasoning text both surface on
+                // the canonical `delta.reasoning_content` field. Upstream emits
+                // both events for o-series / GPT-5 reasoning; merging them here
+                // keeps the client-visible stream unambiguously on one channel.
+                "response.reasoning_summary_text.delta"
+                | "response.reasoning_text.delta" => {
+                    let delta = payload.get("delta").and_then(Value::as_str).unwrap_or("");
+                    if delta.is_empty() {
+                        continue;
+                    }
+                    if !role_emitted {
+                        role_emitted = true;
+                        yield opener_chunk(&response_id, &model_name, created);
+                    }
+                    yield reasoning_chunk(&response_id, &model_name, created, delta);
+                }
                 "response.output_item.done" => {
                     let Some(item) = payload.get("item") else { continue };
                     if item.get("type").and_then(Value::as_str) == Some("function_call") {
@@ -429,6 +442,20 @@ fn text_chunk(id: &str, model: &str, created: i64, delta: &str) -> ChatCompletio
         created,
         ChatDelta {
             content: Some(delta.to_string()),
+            ..Default::default()
+        },
+        None,
+        None,
+    )
+}
+
+fn reasoning_chunk(id: &str, model: &str, created: i64, delta: &str) -> ChatCompletionChunk {
+    base_chunk(
+        id,
+        model,
+        created,
+        ChatDelta {
+            reasoning_content: Some(delta.to_string()),
             ..Default::default()
         },
         None,
@@ -650,36 +677,11 @@ mod tests {
     }
 
     #[test]
-    fn request_maps_max_tokens_to_max_output_tokens() {
-        let req = parse_req(
-            r#"{
-                "model":"m",
-                "messages":[{"role":"user","content":"x"}],
-                "max_tokens":512
-            }"#,
-        );
-        let body = chat_request_to_responses_body(&req, "gpt-5.2");
-        assert_eq!(body["max_output_tokens"], 512);
-    }
-
-    #[test]
-    fn request_maps_max_completion_tokens_to_max_output_tokens() {
-        let req = parse_req(
-            r#"{
-                "model":"m",
-                "messages":[{"role":"user","content":"x"}],
-                "max_completion_tokens":1024
-            }"#,
-        );
-        let body = chat_request_to_responses_body(&req, "gpt-5.2");
-        assert_eq!(
-            body["max_output_tokens"], 1024,
-            "Responses API must honor the modern max_completion_tokens alias",
-        );
-    }
-
-    #[test]
-    fn request_prefers_max_completion_tokens_when_both_are_set() {
+    fn request_omits_max_output_tokens_even_when_client_sets_max_tokens() {
+        // The Responses API does not accept a `max_output_tokens` (or any
+        // sibling) field — upstream returns `400 Unsupported parameter`. We
+        // therefore drop the client's `max_tokens` on the floor for codex
+        // rather than translate it.
         let req = parse_req(
             r#"{
                 "model":"m",
@@ -689,7 +691,10 @@ mod tests {
             }"#,
         );
         let body = chat_request_to_responses_body(&req, "gpt-5.2");
-        assert_eq!(body["max_output_tokens"], 1024);
+        assert!(
+            body.get("max_output_tokens").is_none(),
+            "Responses API rejects max_output_tokens; translator must omit it",
+        );
     }
 
     #[test]

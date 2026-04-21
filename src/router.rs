@@ -502,6 +502,7 @@ mod tests {
         ChatMessage {
             role: "user".to_string(),
             content: Some(MessageContent::Text(text.to_string())),
+            reasoning_content: None,
             name: None,
             tool_calls: None,
             tool_call_id: None,
@@ -512,6 +513,7 @@ mod tests {
         ChatMessage {
             role: "assistant".to_string(),
             content: Some(MessageContent::Text(text.to_string())),
+            reasoning_content: None,
             name: None,
             tool_calls: None,
             tool_call_id: None,
@@ -522,6 +524,7 @@ mod tests {
         ChatMessage {
             role: "system".to_string(),
             content: Some(MessageContent::Text(text.to_string())),
+            reasoning_content: None,
             name: None,
             tool_calls: None,
             tool_call_id: None,

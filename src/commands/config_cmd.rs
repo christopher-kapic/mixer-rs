@@ -47,10 +47,12 @@ fn edit() -> Result<()> {
 /// Set a dotted-path config value. Supported keys (for now):
 ///   - `listen_addr` (string)
 ///   - `default_model` (string)
+///   - `listen_bearer_token_env` (string — name of the env var holding the token; never the token itself)
 ///   - `providers.<id>.enabled` (bool)
 ///   - `providers.<id>.max_concurrent_requests` (integer)
 ///   - `providers.<id>.base_url` (string)
 ///   - `providers.<id>.request_timeout_secs` (integer)
+///   - `providers.<id>.api_key_env` (string — name of the env var, not the key)
 fn set(key: &str, value: &str) -> Result<()> {
     let path = paths::config_file()?;
     let mut config = if path.exists() {
@@ -62,6 +64,16 @@ fn set(key: &str, value: &str) -> Result<()> {
     match key {
         "listen_addr" => config.listen_addr = value.to_string(),
         "default_model" => config.default_model = value.to_string(),
+        "listen_bearer_token_env" => {
+            config.listen_bearer_token_env = if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            };
+        }
+        "listen_bearer_token" => bail!(
+            "refusing to store a literal bearer token in config; use `listen_bearer_token_env` to name an environment variable that holds the token"
+        ),
         k if k.starts_with("providers.") => {
             let rest = &k["providers.".len()..];
             let (provider_id, field) = rest
@@ -85,6 +97,16 @@ fn set(key: &str, value: &str) -> Result<()> {
                 "request_timeout_secs" => {
                     entry.request_timeout_secs = parse_opt_u64(value)?;
                 }
+                "api_key_env" => {
+                    entry.api_key_env = if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    };
+                }
+                "api_key" => bail!(
+                    "refusing to store a literal API key in config; use `api_key_env` to name an environment variable, or `mixer auth login {provider_id}` to store it in credentials"
+                ),
                 other => bail!("unsupported provider field `{other}`"),
             }
         }

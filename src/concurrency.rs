@@ -68,6 +68,10 @@ mod tests {
     #[tokio::test]
     async fn capped_provider_serialises_requests() {
         let mut c = Config::default();
+        // Clear defaults so the assertion on `capped_providers()` only sees
+        // the selfhost entry we're exercising — `Config::default` ships with
+        // its own capped ollama entry that is irrelevant to this test.
+        c.providers.clear();
         c.providers.insert(
             "selfhost".to_string(),
             ProviderSettings {

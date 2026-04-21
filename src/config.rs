@@ -3,7 +3,8 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Top-level mixer configuration, stored at `~/.config/mixer/config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -26,6 +27,16 @@ pub struct Config {
     /// `credentials/`; these are non-secret behavioural overrides).
     #[serde(default)]
     pub providers: HashMap<String, ProviderSettings>,
+
+    /// Name of an environment variable holding a shared-secret bearer token
+    /// that clients must present in `Authorization: Bearer <token>` on every
+    /// `/v1/*` request. Only the env var *name* is stored here — never the
+    /// token itself (same rationale as `api_key_env`, plan.md §3.6.2). When
+    /// unset, or when the env var resolves to an empty string, the local
+    /// endpoint accepts unauthenticated requests (preserves today's default
+    /// loopback-only behaviour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_bearer_token_env: Option<String>,
 }
 
 /// A virtual mixer model — a pool of concrete provider/model backends plus
@@ -47,6 +58,70 @@ pub struct MixerModel {
     /// Keyed by provider id. Providers absent from this map fall back to 1.0.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub weights: HashMap<String, f64>,
+
+    /// Optional sticky-session mode: pin a given conversation (or a
+    /// client-supplied session header) to a single backend via consistent
+    /// hashing over the eligible pool. Preserves KV-cache locality at the
+    /// cost of even distribution. Unset / `enabled: false` preserves today's
+    /// stateless per-request routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sticky: Option<StickyConfig>,
+}
+
+/// Sticky-session policy for a mixer model. See [`MixerModel::sticky`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StickyConfig {
+    /// When false, sticky routing is off and the model uses its normal
+    /// strategy.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// What to derive the sticky key from. See [`StickyKey`].
+    pub key: StickyKey,
+}
+
+/// How to compute a sticky-session key from the incoming request.
+///
+/// Serialised as a string to match the config shape documented in plan.md §10:
+///   * `"messages_hash"` — hash the conversation prefix (every message except
+///     the trailing run of user messages). Deterministic for a given input,
+///     which lets identical conversation snapshots route to the same backend.
+///   * `"header:<Name>"` — pull a named header from the request (e.g.
+///     `"header:X-Session-Id"`); absent or empty header falls through to the
+///     model's normal strategy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StickyKey {
+    MessagesHash,
+    Header(String),
+}
+
+impl Serialize for StickyKey {
+    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        match self {
+            StickyKey::MessagesHash => ser.serialize_str("messages_hash"),
+            StickyKey::Header(name) => ser.serialize_str(&format!("header:{name}")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StickyKey {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(de)?;
+        if raw == "messages_hash" {
+            return Ok(StickyKey::MessagesHash);
+        }
+        if let Some(name) = raw.strip_prefix("header:") {
+            if name.is_empty() {
+                return Err(D::Error::custom(
+                    "sticky key `header:` requires a header name after the colon",
+                ));
+            }
+            return Ok(StickyKey::Header(name.to_string()));
+        }
+        Err(D::Error::custom(format!(
+            "unknown sticky key `{raw}` (expected `messages_hash` or `header:<Name>`)"
+        )))
+    }
 }
 
 /// A single concrete backend: a provider plus one of that provider's models.
@@ -79,7 +154,15 @@ pub enum RoutingStrategy {
 }
 
 /// Non-secret, per-provider settings.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+///
+/// Note the hand-written [`Default`] impl: a provider entry missing from the
+/// config map must behave the same as one that parsed with all fields at their
+/// serde defaults. That means `enabled: true` (matching `default_true()` on
+/// the field below). The `#[derive(Default)]` that used to live here produced
+/// `enabled: false` — routing and `mixer providers list` disagreed on whether
+/// a missing entry was enabled, so sparse configs silently behaved
+/// inconsistently.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderSettings {
     /// When false, the provider is skipped even if authenticated.
     #[serde(default = "default_true")]
@@ -101,6 +184,12 @@ pub struct ProviderSettings {
     /// the client default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_timeout_secs: Option<u64>,
+
+    /// Name of an environment variable to read the provider's API key from.
+    /// When set and non-empty at request time, this takes precedence over any
+    /// stored credential file. Only meaningful for API-key providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
 }
 
 fn default_listen_addr() -> String {
@@ -140,34 +229,72 @@ impl Default for Config {
                         provider: "opencode".to_string(),
                         model: "anthropic/claude-sonnet-4-6".to_string(),
                     },
+                    Backend {
+                        provider: "kimi-code".to_string(),
+                        model: "kimi-k2.6".to_string(),
+                    },
                 ],
                 strategy: RoutingStrategy::Random,
                 weights: HashMap::new(),
+                sticky: None,
             },
         );
 
         let mut providers = HashMap::new();
-        for id in ["codex", "minimax", "glm", "opencode"] {
+        for id in ["codex", "minimax", "glm", "opencode", "kimi-code"] {
             providers.insert(id.to_string(), ProviderSettings::default_enabled());
         }
+        // `kimi-api` is the pay-per-token backup to `kimi-code`. Off by
+        // default so the subscription path is the advertised one; users flip
+        // `enabled` if they want to add pay-per-token Kimi to their pool.
+        providers.insert(
+            "kimi-api".to_string(),
+            ProviderSettings {
+                enabled: false,
+                ..ProviderSettings::default_enabled()
+            },
+        );
+        // Self-hosted ollama is opt-in: disabled by default, with a sensible
+        // concurrency cap for GPU-constrained hosts. Users flip `enabled` once
+        // they have a local ollama server running.
+        providers.insert(
+            "ollama".to_string(),
+            ProviderSettings {
+                enabled: false,
+                max_concurrent_requests: Some(2),
+                ..ProviderSettings::default_enabled()
+            },
+        );
 
         Self {
             listen_addr: default_listen_addr(),
             default_model: default_default_model(),
             models,
             providers,
+            listen_bearer_token_env: None,
         }
     }
 }
 
-impl ProviderSettings {
-    pub fn default_enabled() -> Self {
+impl Default for ProviderSettings {
+    fn default() -> Self {
         Self {
             enabled: true,
             base_url: None,
             max_concurrent_requests: None,
             request_timeout_secs: None,
+            api_key_env: None,
         }
+    }
+}
+
+impl ProviderSettings {
+    /// Retained as a readability alias for the many call sites that build a
+    /// `ProviderSettings` with only a base URL or concurrency cap overridden
+    /// (`..ProviderSettings::default_enabled()`). Equivalent to `Self::default()`
+    /// now that the hand-written [`Default`] impl matches.
+    pub fn default_enabled() -> Self {
+        Self::default()
     }
 }
 
@@ -236,16 +363,47 @@ mod tests {
     }
 
     #[test]
-    fn default_enables_four_builtin_providers() {
+    fn default_enables_subscription_providers() {
         let c = Config::default();
-        assert!(c.providers.contains_key("codex"));
-        assert!(c.providers.contains_key("minimax"));
-        assert!(c.providers.contains_key("glm"));
-        assert!(c.providers.contains_key("opencode"));
-        for s in c.providers.values() {
-            assert!(s.enabled);
-            assert!(s.max_concurrent_requests.is_none());
+        for id in ["codex", "minimax", "glm", "opencode", "kimi-code"] {
+            let s = c
+                .providers
+                .get(id)
+                .unwrap_or_else(|| panic!("missing {id}"));
+            assert!(s.enabled, "{id} should be enabled by default");
+            assert!(
+                s.max_concurrent_requests.is_none(),
+                "{id} should be uncapped by default",
+            );
         }
+    }
+
+    #[test]
+    fn default_disables_kimi_api_pay_per_token_path() {
+        let c = Config::default();
+        let kimi_api = c
+            .providers
+            .get("kimi-api")
+            .expect("kimi-api should be in default providers map");
+        assert!(
+            !kimi_api.enabled,
+            "kimi-api is opt-in (backup to kimi-code)"
+        );
+    }
+
+    #[test]
+    fn default_disables_self_hosted_ollama_with_concurrency_cap() {
+        let c = Config::default();
+        let ollama = c
+            .providers
+            .get("ollama")
+            .expect("ollama should be in default providers map");
+        assert!(!ollama.enabled, "ollama is opt-in");
+        assert_eq!(
+            ollama.max_concurrent_requests,
+            Some(2),
+            "default cap guards GPU-constrained hosts",
+        );
     }
 
     #[test]
@@ -281,10 +439,65 @@ mod tests {
                 }],
                 strategy: RoutingStrategy::Random,
                 weights: HashMap::new(),
+                sticky: None,
             },
         );
         let (name, _) = c.resolve_model("vision").unwrap();
         assert_eq!(name, "vision");
+    }
+
+    #[test]
+    fn sticky_key_messages_hash_round_trips() {
+        let raw = r#""messages_hash""#;
+        let key: StickyKey = serde_json::from_str(raw).unwrap();
+        assert_eq!(key, StickyKey::MessagesHash);
+        assert_eq!(serde_json::to_string(&key).unwrap(), raw);
+    }
+
+    #[test]
+    fn sticky_key_header_round_trips() {
+        let raw = r#""header:X-Session-Id""#;
+        let key: StickyKey = serde_json::from_str(raw).unwrap();
+        assert_eq!(key, StickyKey::Header("X-Session-Id".to_string()));
+        assert_eq!(serde_json::to_string(&key).unwrap(), raw);
+    }
+
+    #[test]
+    fn sticky_key_rejects_unknown_and_empty_header_name() {
+        assert!(serde_json::from_str::<StickyKey>(r#""nope""#).is_err());
+        assert!(serde_json::from_str::<StickyKey>(r#""header:""#).is_err());
+    }
+
+    #[test]
+    fn mixer_model_parses_sticky_block() {
+        let raw = r#"{
+            "backends": [{"provider":"codex","model":"gpt-5.2"}],
+            "sticky": {"enabled": true, "key": "messages_hash"}
+        }"#;
+        let m: MixerModel = serde_json::from_str(raw).unwrap();
+        let s = m.sticky.expect("sticky should be present");
+        assert!(s.enabled);
+        assert_eq!(s.key, StickyKey::MessagesHash);
+    }
+
+    #[test]
+    fn provider_settings_default_matches_serde_default() {
+        // A sparse config that mentions a provider by name but omits every
+        // field must deserialise to the same shape as one that never mentions
+        // the provider at all. Both routes previously diverged: the former
+        // flowed through serde (enabled=true via `default_true()`), the
+        // latter through `unwrap_or_default()` (enabled=false via the
+        // auto-derived `Default`). Users saw routing and
+        // `mixer providers list` disagree about whether the provider was
+        // enabled.
+        let parsed: ProviderSettings = serde_json::from_str("{}").unwrap();
+        let explicit = ProviderSettings::default();
+        assert_eq!(parsed, explicit);
+        assert!(
+            ProviderSettings::default().enabled,
+            "a missing provider entry must be treated as enabled so routing and \
+             diagnostics agree on sparse configs",
+        );
     }
 
     #[test]

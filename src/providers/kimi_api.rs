@@ -1,17 +1,20 @@
-//! opencode.ai Zen subscription provider.
+//! Moonshot pay-per-token API provider ("kimi-api").
 //!
-//! Wire protocol: OpenAI-compatible Chat Completions (the Zen gateway also
-//! exposes Anthropic and Responses-API routes at sibling paths; we use
-//! `/chat/completions`).
-//! Base URL: `https://opencode.ai/zen/v1` (override via
-//! `providers.opencode.base_url` in config).
-//! Auth: `x-api-key: <api_key>` (note: *not* the `Authorization: Bearer`
-//! scheme used by minimax and glm).
+//! Wire protocol: OpenAI-compatible Chat Completions.
+//! Base URL: `https://api.moonshot.ai/v1` (override via
+//! `providers.kimi-api.base_url` in config).
+//! Auth: `Authorization: Bearer <api_key>`.
 //!
-//! Login stores the pasted API key at
-//! `~/.config/mixer/credentials/opencode.json` (0600). At dispatch time the
-//! key resolves env-var-first via [`CredentialStore::load_api_key`], so an
-//! environment-provided key wins over anything on disk (see plan.md §3.6.2).
+//! This is the non-subscription path — users generate a key at
+//! `platform.moonshot.ai` and pay per token. Compared to `kimi-code`, there
+//! is no OAuth flow, no subscription quota, and no usage introspection
+//! endpoint, so `usage()` always returns `None`.
+//!
+//! Kept as a sibling of `kimi-code` (rather than folded into it) because the
+//! `AuthKind` is fundamentally different: one value per provider, used by
+//! `mixer auth status` and the CLI dispatch. Users can enable either or
+//! both; `kimi-api` is off by default so the subscription path is the
+//! advertised one.
 
 use std::time::Duration;
 
@@ -24,33 +27,27 @@ use crate::openai::ChatRequest;
 use crate::providers::common::api_key_login::prompt_and_store_api_key;
 use crate::providers::common::openai_client::{self, AuthScheme};
 use crate::providers::{AuthKind, ChatStream, ModelInfo, Provider};
-use crate::usage::UsageSnapshot;
 
-const DEFAULT_BASE_URL: &str = "https://opencode.ai/zen/v1";
+const DEFAULT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 const CHAT_PATH: &str = "/chat/completions";
-const AUTH_HEADER: &str = "x-api-key";
 
-pub struct OpencodeProvider;
+pub struct KimiApiProvider;
 
 #[async_trait]
-impl Provider for OpencodeProvider {
+impl Provider for KimiApiProvider {
     fn id(&self) -> &'static str {
-        "opencode"
+        "kimi-api"
     }
 
     fn display_name(&self) -> &'static str {
-        "opencode"
+        "Kimi (Moonshot API key)"
     }
 
     fn models(&self) -> Vec<ModelInfo> {
         vec![
-            ModelInfo::new(
-                "anthropic/claude-sonnet-4-6",
-                "Claude Sonnet 4.6 (via opencode)",
-                true,
-                1_000_000,
-            ),
-            ModelInfo::new("openai/gpt-5.2", "GPT-5.2 (via opencode)", true, 400_000),
+            ModelInfo::new("kimi-k2.6", "Kimi K2.6", false, 256_000),
+            ModelInfo::new("kimi-k2.5", "Kimi K2.5", false, 256_000),
+            ModelInfo::new("kimi-k2-thinking", "Kimi K2 Thinking", false, 256_000),
         ]
     }
 
@@ -65,19 +62,8 @@ impl Provider for OpencodeProvider {
     }
 
     async fn login(&self, store: &CredentialStore) -> Result<()> {
-        eprintln!("Sign in at https://opencode.ai/auth to generate a Zen API key");
+        eprintln!("Generate a Moonshot API key at https://platform.moonshot.ai/");
         prompt_and_store_api_key(store, self.id(), self.display_name())
-    }
-
-    /// The Zen gateway tracks usage server-side but offers no client-facing
-    /// quota endpoint (verified against opencode's own source — usage is only
-    /// surfaced via per-request response metadata).
-    async fn usage(
-        &self,
-        _store: &CredentialStore,
-        _settings: &ProviderSettings,
-    ) -> Result<Option<UsageSnapshot>> {
-        Ok(None)
     }
 
     async fn chat_completion(
@@ -87,20 +73,13 @@ impl Provider for OpencodeProvider {
         req: ChatRequest,
     ) -> Result<ChatStream> {
         let api_key = store.load_api_key(self.id(), settings).ok_or_else(|| {
-            anyhow!("opencode is not authenticated; run `mixer auth login opencode`")
+            anyhow!("kimi-api is not authenticated; run `mixer auth login kimi-api`")
         })?;
         let base = settings.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
         let url = format!("{}{CHAT_PATH}", base.trim_end_matches('/'));
         let timeout = settings.request_timeout_secs.map(Duration::from_secs);
-        openai_client::chat_completion(
-            self.id(),
-            &url,
-            &api_key,
-            AuthScheme::ApiKeyHeader(AUTH_HEADER),
-            timeout,
-            req,
-        )
-        .await
+        openai_client::chat_completion(self.id(), &url, &api_key, AuthScheme::Bearer, timeout, req)
+            .await
     }
 }
 
@@ -129,29 +108,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_completion_uses_x_api_key_header_not_bearer() {
+    async fn chat_completion_proxies_through_base_url_with_bearer_auth() {
         let tmp = TempDir::new().unwrap();
         let store = store_in(&tmp);
         store
-            .save("opencode", &json!({ "api_key": "sk-zen" }))
+            .save("kimi-api", &json!({ "api_key": "sk-moonshot-test" }))
             .unwrap();
 
         let body = sse(&[
-            r#"{"id":"r","object":"chat.completion.chunk","created":1,"model":"anthropic/claude-sonnet-4-6","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}"#,
+            r#"{"id":"r","object":"chat.completion.chunk","created":1,"model":"kimi-k2.6","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}"#,
             r#"[DONE]"#,
         ]);
         let mock = start_mock_chat(200, "text/event-stream", body).await;
         let settings = settings_with_base(&format!("http://{}", mock.addr));
-        let stream = OpencodeProvider
+
+        let stream = KimiApiProvider
             .chat_completion(&store, &settings, sample_request())
             .await
             .unwrap();
-        let _: Vec<_> = stream.collect().await;
-
-        assert_eq!(mock.captured.header("x-api-key").as_deref(), Some("sk-zen"),);
-        assert!(
-            mock.captured.header("authorization").is_none(),
-            "opencode must not send Authorization: Bearer",
+        let chunks: Vec<_> = stream.collect().await;
+        let chunks: Vec<_> = chunks
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .expect("no stream errors");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            mock.captured.header("authorization").as_deref(),
+            Some("Bearer sk-moonshot-test")
         );
     }
 
@@ -160,16 +143,16 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = store_in(&tmp);
         store
-            .save("opencode", &json!({ "api_key": "wrong" }))
+            .save("kimi-api", &json!({ "api_key": "wrong" }))
             .unwrap();
         let mock = start_mock_chat(
             401,
             "application/json",
-            r#"{"error":"bad key"}"#.to_string(),
+            r#"{"error":"unauthorized"}"#.to_string(),
         )
         .await;
         let settings = settings_with_base(&format!("http://{}", mock.addr));
-        let result = OpencodeProvider
+        let result = KimiApiProvider
             .chat_completion(&store, &settings, sample_request())
             .await;
         let err = match result {
@@ -179,19 +162,7 @@ mod tests {
         let auth = err
             .downcast_ref::<AuthenticationError>()
             .expect("should be AuthenticationError");
-        assert!(auth.message.contains("mixer auth login opencode"));
-    }
-
-    #[tokio::test]
-    async fn usage_returns_none() {
-        let tmp = TempDir::new().unwrap();
-        let store = store_in(&tmp);
-        let settings = ProviderSettings::default_enabled();
-        let snap = OpencodeProvider.usage(&store, &settings).await.unwrap();
-        assert!(
-            snap.is_none(),
-            "opencode Zen has no client-facing usage endpoint — must return Ok(None)"
-        );
+        assert!(auth.message.contains("mixer auth login kimi-api"));
     }
 
     #[tokio::test]
@@ -199,7 +170,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = store_in(&tmp);
         let settings = ProviderSettings::default_enabled();
-        let result = OpencodeProvider
+        let result = KimiApiProvider
             .chat_completion(&store, &settings, sample_request())
             .await;
         let err = match result {
@@ -207,5 +178,38 @@ mod tests {
             Ok(_) => panic!("missing credentials should error"),
         };
         assert!(err.to_string().contains("not authenticated"));
+    }
+
+    #[tokio::test]
+    async fn chat_completion_prefers_env_var_over_stored_file() {
+        let tmp = TempDir::new().unwrap();
+        let store = store_in(&tmp);
+        store
+            .save("kimi-api", &json!({ "api_key": "sk-from-file" }))
+            .unwrap();
+
+        let body = sse(&[
+            r#"{"id":"r","model":"m","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}"#,
+        ]);
+        let mock = start_mock_chat(200, "text/event-stream", body).await;
+        let var = "MIXER_TEST_KIMI_API_KEY";
+        unsafe { std::env::set_var(var, "sk-from-env") };
+        let settings = ProviderSettings {
+            base_url: Some(format!("http://{}", mock.addr)),
+            api_key_env: Some(var.to_string()),
+            ..ProviderSettings::default_enabled()
+        };
+        let stream = KimiApiProvider
+            .chat_completion(&store, &settings, sample_request())
+            .await
+            .unwrap();
+        let _: Vec<_> = stream.collect().await;
+        unsafe { std::env::remove_var(var) };
+
+        assert_eq!(
+            mock.captured.header("authorization").as_deref(),
+            Some("Bearer sk-from-env"),
+            "env var should shadow the stored file key",
+        );
     }
 }

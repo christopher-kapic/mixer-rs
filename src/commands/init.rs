@@ -41,7 +41,7 @@ pub fn run(non_interactive: bool) -> Result<()> {
     eprintln!("  Default:      {}", config.default_model);
     eprintln!();
     eprintln!("Next steps:");
-    eprintln!("  mixer login <provider>   — for each subscription you want to mix");
+    eprintln!("  mixer auth login <provider>   — for each subscription you want to mix");
     eprintln!("  mixer providers list     — see auth state and usage");
     eprintln!("  mixer serve              — start the OpenAI-compatible endpoint");
     Ok(())

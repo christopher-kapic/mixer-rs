@@ -7,28 +7,78 @@
 //! caps, image-capability filtering — is handled generically.
 
 pub mod codex;
+pub mod common;
 pub mod glm;
+pub mod kimi_api;
+pub mod kimi_code;
 pub mod minimax;
+pub mod ollama;
 pub mod opencode;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use futures::Stream;
 
 use crate::config::ProviderSettings;
 use crate::credentials::CredentialStore;
-use crate::openai::{ChatRequest, ChatResponse};
+use crate::openai::{ChatCompletionChunk, ChatRequest};
 use crate::usage::UsageSnapshot;
+
+/// Streaming output of [`Provider::chat_completion`]. The server adapts this
+/// to either an SSE response (when the client asked for `stream: true`) or a
+/// single accumulated JSON response.
+pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>>;
 
 /// What a provider's model can process. A model is omitted from the pool for
 /// image-bearing requests when `supports_images == false`.
+///
+/// `id` and `display_name` are `Cow<'static, str>` so static built-in catalogues
+/// stay zero-alloc (`Cow::Borrowed`) while providers that fetch their catalogue
+/// at runtime — e.g. Ollama — can supply owned strings without leaking memory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelInfo {
-    pub id: &'static str,
-    pub display_name: &'static str,
+    pub id: Cow<'static, str>,
+    pub display_name: Cow<'static, str>,
     pub supports_images: bool,
+    /// Total context window in tokens (input + output), as the provider
+    /// advertises it. Consumed by the router's context-window exclusion filter.
+    pub context_window: u32,
+}
+
+impl ModelInfo {
+    pub fn new(
+        id: impl Into<Cow<'static, str>>,
+        display_name: impl Into<Cow<'static, str>>,
+        supports_images: bool,
+        context_window: u32,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            display_name: display_name.into(),
+            supports_images,
+            context_window,
+        }
+    }
+}
+
+/// How a provider authenticates. Drives `mixer auth status` output and lets
+/// the CLI know whether `api_key_env` is applicable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthKind {
+    /// Static API key — may be sourced from `settings.api_key_env` or the
+    /// stored credentials file. See `CredentialStore::load_api_key`.
+    ApiKey,
+    /// OAuth device-authorization flow with refreshable access tokens.
+    DeviceFlow,
+    /// No authentication — e.g. a self-hosted ollama server reached over the
+    /// local network. `mixer auth` treats these as always authenticated and
+    /// skips credential bookkeeping.
+    None,
 }
 
 #[async_trait]
@@ -44,9 +94,17 @@ pub trait Provider: Send + Sync {
     /// of whether the user has enabled all of them in config.
     fn models(&self) -> Vec<ModelInfo>;
 
-    /// Whether the user has stored credentials that look usable. Providers
+    /// How this provider authenticates. Informs `mixer auth status` about
+    /// whether env-var sources and OAuth freshness details apply.
+    fn auth_kind(&self) -> AuthKind;
+
+    /// Whether the user has credentials that look currently usable. Providers
     /// should lean toward "yes" here — a real probe happens on dispatch.
-    fn is_authenticated(&self, store: &CredentialStore) -> bool {
+    ///
+    /// Default behavior inspects the stored file only, which is enough for
+    /// device-flow providers to override meaningfully and for API-key
+    /// providers to consult `settings.api_key_env`.
+    fn is_authenticated(&self, store: &CredentialStore, _settings: &ProviderSettings) -> bool {
         store.exists(self.id())
     }
 
@@ -61,19 +119,30 @@ pub trait Provider: Send + Sync {
 
     /// Best-effort snapshot of current subscription consumption. `None` means
     /// the provider does not (yet) expose this.
-    async fn usage(&self, _store: &CredentialStore) -> Result<Option<UsageSnapshot>> {
+    ///
+    /// Called lazily by the usage-aware router on each pick (no background
+    /// polling, no caching). Transient endpoint failures should degrade to
+    /// `Ok(None)` rather than propagate, so a broken telemetry endpoint
+    /// doesn't cascade into a routing failure.
+    async fn usage(
+        &self,
+        _store: &CredentialStore,
+        _settings: &ProviderSettings,
+    ) -> Result<Option<UsageSnapshot>> {
         Ok(None)
     }
 
     /// Execute a chat completion. `req.model` has already been rewritten by
     /// the router to the provider-native model id; `settings` carries the
-    /// user's overrides (base URL, timeout, etc.).
+    /// user's overrides (base URL, timeout, etc.). Providers always return a
+    /// stream of [`ChatCompletionChunk`]s; the server collapses them into a
+    /// single response for non-streaming clients.
     async fn chat_completion(
         &self,
         store: &CredentialStore,
         settings: &ProviderSettings,
         req: ChatRequest,
-    ) -> Result<ChatResponse>;
+    ) -> Result<ChatStream>;
 }
 
 /// A registry that owns each [`Provider`] via `Arc<dyn Provider>` and offers
@@ -118,6 +187,9 @@ pub fn builtin_registry() -> ProviderRegistry {
     r.register(Arc::new(minimax::MinimaxProvider));
     r.register(Arc::new(glm::GlmProvider));
     r.register(Arc::new(opencode::OpencodeProvider));
+    r.register(Arc::new(kimi_code::KimiCodeProvider));
+    r.register(Arc::new(kimi_api::KimiApiProvider));
+    r.register(Arc::new(ollama::OllamaProvider));
     r
 }
 
@@ -126,10 +198,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builtin_registry_has_four_providers() {
+    fn builtin_registry_has_all_providers() {
         let r = builtin_registry();
         let ids = r.ids();
-        assert_eq!(ids, vec!["codex", "glm", "minimax", "opencode"]);
+        assert_eq!(
+            ids,
+            vec![
+                "codex",
+                "glm",
+                "kimi-api",
+                "kimi-code",
+                "minimax",
+                "ollama",
+                "opencode",
+            ],
+        );
     }
 
     #[test]
@@ -137,5 +220,11 @@ mod tests {
         let r = builtin_registry();
         let err = r.get("not-a-real-provider").err().expect("expected error");
         assert!(err.to_string().contains("unknown provider"));
+    }
+
+    #[test]
+    fn model_info_new_stores_context_window() {
+        let info = ModelInfo::new("x", "X", false, 1024);
+        assert_eq!(info.context_window, 1024);
     }
 }

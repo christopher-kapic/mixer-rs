@@ -21,12 +21,10 @@ async fn list(verbose: bool, as_json: bool) -> Result<()> {
     let mut rows = Vec::new();
     for id in registry.ids() {
         let p = registry.get(id)?;
-        let authed = p.is_authenticated(&credentials);
-        let enabled = config.providers.get(id).map(|s| s.enabled).unwrap_or(true);
-        let max_conc = config
-            .providers
-            .get(id)
-            .and_then(|s| s.max_concurrent_requests);
+        let settings = config.providers.get(id).cloned().unwrap_or_default();
+        let authed = p.is_authenticated(&credentials, &settings);
+        let enabled = settings.enabled;
+        let max_conc = settings.max_concurrent_requests;
         rows.push(json!({
             "id": p.id(),
             "display_name": p.display_name(),
@@ -80,13 +78,13 @@ async fn show(name: &str, as_json: bool) -> Result<()> {
     let config = Config::load_or_default()?;
     let p = registry.get(name)?;
 
-    let usage = p.usage(&credentials).await.unwrap_or(None);
     let settings = config.providers.get(name).cloned().unwrap_or_default();
+    let usage = p.usage(&credentials, &settings).await.unwrap_or(None);
 
     let payload = json!({
         "id": p.id(),
         "display_name": p.display_name(),
-        "authenticated": p.is_authenticated(&credentials),
+        "authenticated": p.is_authenticated(&credentials, &settings),
         "settings": settings,
         "usage": usage,
         "models": p.models().into_iter().map(|m| json!({
@@ -99,5 +97,22 @@ async fn show(name: &str, as_json: bool) -> Result<()> {
     // Pretty JSON is the canonical human-readable format for `show`.
     let _ = as_json;
     println!("{}", serde_json::to_string_pretty(&payload)?);
+    if let Some(snap) = &usage {
+        println!();
+        println!("{}", format_usage_line(snap));
+    }
     Ok(())
+}
+
+/// Human-friendly one-liner for a [`UsageSnapshot`], shown alongside the JSON
+/// payload. Intentionally concise — the JSON already carries the full shape.
+fn format_usage_line(snap: &crate::usage::UsageSnapshot) -> String {
+    let pct = snap
+        .fraction_used
+        .map(|f| format!("{:.1}%", (f * 100.0).clamp(0.0, 100.0)))
+        .unwrap_or_else(|| "unknown".to_string());
+    match &snap.label {
+        Some(label) => format!("usage: {pct} ({} — {})", snap.window, label),
+        None => format!("usage: {pct} ({})", snap.window),
+    }
 }

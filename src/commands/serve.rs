@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::credentials::CredentialStore;
 use crate::providers::builtin_registry;
 use crate::server::{AppState, serve};
+use crate::usage::UsageCache;
 
 pub async fn run(addr: Option<String>, port: Option<u16>, model: Option<String>) -> Result<()> {
     let config = Config::load_or_default()?;
@@ -31,6 +32,7 @@ pub async fn run(addr: Option<String>, port: Option<u16>, model: Option<String>)
         registry: Arc::new(registry),
         credentials: Arc::new(credentials),
         concurrency,
+        usage_cache: UsageCache::default(),
         pinned_model: model,
     };
 

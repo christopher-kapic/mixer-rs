@@ -37,7 +37,7 @@ use crate::providers::common::oauth_refresh::{
 use crate::providers::common::responses_api::{
     chat_request_to_responses_body, responses_sse_to_chat_chunks,
 };
-use crate::providers::{AuthKind, ChatStream, ModelInfo, Provider};
+use crate::providers::{AuthKind, ChatStream, ModelInfo, Provider, ReasoningFormat};
 use crate::usage::UsageSnapshot;
 
 /// OAuth client identifier published by the Codex CLI. Matches the value in
@@ -70,9 +70,22 @@ impl Provider for CodexProvider {
     }
 
     fn models(&self) -> Vec<ModelInfo> {
+        // Sourced from codex-rs's bundled `models-manager/models.json` — the
+        // compile-time catalogue the Codex CLI itself loads. Codex also hits
+        // a live `/models` endpoint when authed via ChatGPT, but this trait
+        // method is synchronous and can't block on network I/O; callers that
+        // want a live view should use `mixer providers models codex` (which
+        // falls through the default `list_remote_models` → not supported,
+        // because Codex's live catalogue rides the Responses API auth).
         vec![
-            ModelInfo::new("gpt-5.2", "GPT-5.2", true, 400_000),
-            ModelInfo::new("gpt-5.2-mini", "GPT-5.2 mini", true, 400_000),
+            ModelInfo::new("gpt-5.4", "GPT-5.4", true, 400_000)
+                .with_reasoning(ReasoningFormat::ResponsesApiSummary),
+            ModelInfo::new("gpt-5.4-mini", "GPT-5.4 Mini", true, 400_000)
+                .with_reasoning(ReasoningFormat::ResponsesApiSummary),
+            ModelInfo::new("gpt-5.3-codex", "GPT-5.3 Codex", true, 400_000)
+                .with_reasoning(ReasoningFormat::ResponsesApiSummary),
+            ModelInfo::new("gpt-5.2", "GPT-5.2", true, 400_000)
+                .with_reasoning(ReasoningFormat::ResponsesApiSummary),
         ]
     }
 

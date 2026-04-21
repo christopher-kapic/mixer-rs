@@ -51,9 +51,10 @@ use crate::credentials::CredentialStore;
 use crate::openai::{
     self, ChatRequest, ChatResponse, ModelListEntry, ModelListResponse, request_has_images,
 };
-use crate::providers::ChatStream;
-use crate::providers::ProviderRegistry;
+use crate::providers::ReasoningFormat;
 use crate::providers::common::oauth_refresh::{AuthenticationError, UpstreamHttpError};
+use crate::providers::{ChatStream, ProviderRegistry};
+use crate::reasoning;
 use crate::router;
 use crate::usage::UsageCache;
 
@@ -361,6 +362,18 @@ async fn dispatch_chat(
             .cloned()
             .unwrap_or_else(ProviderSettings::default_enabled);
 
+        // Look up the reasoning dialect for the chosen model so the
+        // normalization pipeline can collapse it onto the canonical field.
+        // Unknown models (e.g. a user-installed ollama model the provider's
+        // `models()` does not list) fall through as `None` — same effect as
+        // today's no-op.
+        let reasoning_format = provider
+            .models()
+            .into_iter()
+            .find(|m| m.id == decision.provider_model)
+            .map(|m| m.reasoning_format)
+            .unwrap_or(ReasoningFormat::None);
+
         let permit = state.concurrency.acquire(&decision.provider_id).await;
 
         let mut req_attempt = req.clone();
@@ -383,6 +396,7 @@ async fn dispatch_chat(
                     last_err = Some(AppError::from_provider(e));
                     continue;
                 }
+                log_terminal_error(&decision.provider_id, &e, "dispatch");
                 return Err(AppError::from_provider(e));
             }
         };
@@ -403,17 +417,25 @@ async fn dispatch_chat(
                     last_err = Some(AppError::from_provider(e));
                     continue;
                 }
+                log_terminal_error(&decision.provider_id, &e, "first-chunk");
                 return Err(AppError::from_provider(e));
             }
             None => {
                 // Empty stream from upstream — surface an empty success.
                 let combined: ChatStream = Box::pin(stream::empty());
-                return finalize_response(combined, permit, wants_stream).await;
+                let normalized = reasoning::normalize(combined, reasoning_format);
+                let rendered = reasoning::render(normalized, state.config.reasoning_output);
+                return finalize_response(rendered, permit, wants_stream).await;
             }
             Some(Ok(first_chunk)) => {
                 let head = stream::once(async move { Ok(first_chunk) });
                 let combined: ChatStream = Box::pin(head.chain(stream));
-                return finalize_response(combined, permit, wants_stream).await;
+                // The normalization pipeline runs after the peek-and-retry
+                // gate so a retryable dispatch error still falls back to an
+                // alternate backend before any stream transform happens.
+                let normalized = reasoning::normalize(combined, reasoning_format);
+                let rendered = reasoning::render(normalized, state.config.reasoning_output);
+                return finalize_response(rendered, permit, wants_stream).await;
             }
         }
     }
@@ -492,6 +514,20 @@ fn log_retry(provider_id: &str, err: &anyhow::Error, where_: &str) {
         stage = where_,
         reason = %reason,
         "retrying on a different backend",
+    );
+}
+
+/// Log a terminal provider error — one that will be rendered to the client as
+/// a 502 (or 401 for `AuthenticationError`). Fires either because the error
+/// wasn't retryable or because we already spent the retry budget. The full
+/// anyhow chain (`{err:#}`) is emitted so upstream status codes and body
+/// snippets land in the logs without having to enable debug-level filters.
+fn log_terminal_error(provider_id: &str, err: &anyhow::Error, stage: &str) {
+    tracing::warn!(
+        from_provider = provider_id,
+        stage = stage,
+        error = %format!("{err:#}"),
+        "surfacing upstream error to client",
     );
 }
 
@@ -730,8 +766,7 @@ mod tests {
                     delta: ChatDelta {
                         role: Some("assistant".to_string()),
                         content: Some("hello ".to_string()),
-                        tool_calls: None,
-                        extra: Default::default(),
+                        ..Default::default()
                     },
                     finish_reason: None,
                 }],
@@ -746,10 +781,8 @@ mod tests {
                 choices: vec![ChunkChoice {
                     index: 0,
                     delta: ChatDelta {
-                        role: None,
                         content: Some("world".to_string()),
-                        tool_calls: None,
-                        extra: Default::default(),
+                        ..Default::default()
                     },
                     finish_reason: Some("stop".to_string()),
                 }],
@@ -765,6 +798,7 @@ mod tests {
             messages: vec![ChatMessage {
                 role: "user".to_string(),
                 content: Some(MessageContent::Text("hi".to_string())),
+                reasoning_content: None,
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
@@ -1032,8 +1066,7 @@ mod tests {
                     delta: ChatDelta {
                         role: Some("assistant".to_string()),
                         content: Some(content.to_string()),
-                        tool_calls: None,
-                        extra: Default::default(),
+                        ..Default::default()
                     },
                     finish_reason: finish.map(|s| s.to_string()),
                 }],

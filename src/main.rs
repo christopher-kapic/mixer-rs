@@ -8,6 +8,7 @@ mod logging;
 mod openai;
 mod paths;
 mod providers;
+mod reasoning;
 mod router;
 mod server;
 mod usage;

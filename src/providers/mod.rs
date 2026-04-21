@@ -48,6 +48,33 @@ pub struct ModelInfo {
     /// Total context window in tokens (input + output), as the provider
     /// advertises it. Consumed by the router's context-window exclusion filter.
     pub context_window: u32,
+    /// Which chain-of-thought dialect this model emits on the wire. Consumed by
+    /// [`crate::reasoning`] to normalize every model's output into the canonical
+    /// `delta.reasoning_content` field before the server renders it to the client.
+    pub reasoning_format: ReasoningFormat,
+}
+
+/// Per-model declaration of the upstream chain-of-thought dialect. Each
+/// provider's `models()` sets this once; `crate::reasoning` does the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReasoningFormat {
+    /// Model doesn't produce chain-of-thought output, or does but it isn't
+    /// separable from the primary content stream. Passthrough.
+    #[default]
+    None,
+    /// DeepSeek-style convention adopted by Kimi, GLM, MiniMax M2, etc.: the
+    /// upstream emits reasoning on `delta.reasoning_content`. Passthrough —
+    /// serde deserializes it into the typed field automatically.
+    Structured,
+    /// Qwen-style: reasoning arrives inline inside `delta.content`, wrapped in
+    /// `<think>…</think>` tags. The normalizer strips the tags and routes the
+    /// enclosed bytes to `delta.reasoning_content`.
+    InlineThinkTags,
+    /// OpenAI Responses API reasoning-summary events
+    /// (`response.reasoning_summary_text.delta` / `response.reasoning_text.delta`).
+    /// Translation happens inside `responses_api.rs`; the normalization stage is
+    /// a passthrough here.
+    ResponsesApiSummary,
 }
 
 impl ModelInfo {
@@ -62,8 +89,29 @@ impl ModelInfo {
             display_name: display_name.into(),
             supports_images,
             context_window,
+            reasoning_format: ReasoningFormat::None,
         }
     }
+
+    /// Declare the upstream reasoning dialect for this model. Chains on top of
+    /// [`ModelInfo::new`] so existing call sites that don't care about reasoning
+    /// need no change.
+    pub fn with_reasoning(mut self, format: ReasoningFormat) -> Self {
+        self.reasoning_format = format;
+        self
+    }
+}
+
+/// A single entry from a provider's live `/v1/models` listing. Returned by
+/// [`Provider::list_remote_models`]. Kept deliberately thin: `id` is the only
+/// field the OpenAI `/v1/models` contract guarantees; `raw` preserves the
+/// unparsed JSON so the CLI can surface whatever additional metadata a
+/// provider chooses to publish (`context_length`, `owned_by`, etc.) without
+/// forcing a schema decision here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteModelEntry {
+    pub id: String,
+    pub raw: serde_json::Value,
 }
 
 /// How a provider authenticates. Drives `mixer auth status` output and lets
@@ -143,6 +191,25 @@ pub trait Provider: Send + Sync {
         settings: &ProviderSettings,
         req: ChatRequest,
     ) -> Result<ChatStream>;
+
+    /// Ask the upstream to list the models it currently serves, by hitting
+    /// its OpenAI-compatible `GET /v1/models` endpoint (or equivalent).
+    ///
+    /// Returning `Ok(None)` means the provider does not offer a live catalogue
+    /// — either the wire protocol is different (codex's Responses API), or the
+    /// vendor simply hasn't shipped one (opencode Zen, z.ai). The CLI treats
+    /// `None` as "unsupported" and prints the hardcoded catalogue with a note.
+    ///
+    /// `Err` is reserved for "the call itself failed" — network errors,
+    /// non-2xx upstream, unparseable response. Those should surface so the
+    /// user can see what went wrong rather than silently falling through.
+    async fn list_remote_models(
+        &self,
+        _store: &CredentialStore,
+        _settings: &ProviderSettings,
+    ) -> Result<Option<Vec<RemoteModelEntry>>> {
+        Ok(None)
+    }
 }
 
 /// A registry that owns each [`Provider`] via `Arc<dyn Provider>` and offers

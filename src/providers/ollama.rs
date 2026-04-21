@@ -44,8 +44,9 @@ use serde::Deserialize;
 use crate::config::ProviderSettings;
 use crate::credentials::CredentialStore;
 use crate::openai::ChatRequest;
+use crate::providers::common::models_list::fetch_openai_models;
 use crate::providers::common::openai_client::{self, AuthScheme};
-use crate::providers::{AuthKind, ChatStream, ModelInfo, Provider};
+use crate::providers::{AuthKind, ChatStream, ModelInfo, Provider, RemoteModelEntry};
 use crate::usage::UsageSnapshot;
 
 const DEFAULT_BASE_URL: &str = "http://localhost:11434/v1";
@@ -243,7 +244,24 @@ impl Provider for OllamaProvider {
         let base = settings.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
         let url = format!("{}{CHAT_PATH}", base.trim_end_matches('/'));
         let timeout = settings.request_timeout_secs.map(Duration::from_secs);
-        openai_client::chat_completion(self.id(), &url, "", AuthScheme::None, timeout, req).await
+        openai_client::chat_completion(self.id(), &url, "", AuthScheme::None, timeout, None, req)
+            .await
+    }
+
+    /// Direct, uncached read of `GET <base_url>/models`. Deliberately bypasses
+    /// the TTL'd in-memory cache that `models()` uses: the CLI path wants a
+    /// live snapshot, not whatever was last served to a routing decision.
+    async fn list_remote_models(
+        &self,
+        _store: &CredentialStore,
+        settings: &ProviderSettings,
+    ) -> Result<Option<Vec<RemoteModelEntry>>> {
+        let base = settings.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
+        let url = format!("{}{MODELS_PATH}", base.trim_end_matches('/'));
+        let timeout = settings.request_timeout_secs.map(Duration::from_secs);
+        let entries =
+            fetch_openai_models(self.id(), &url, "", AuthScheme::None, timeout, None).await?;
+        Ok(Some(entries))
     }
 }
 

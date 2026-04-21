@@ -58,6 +58,13 @@ pub struct ChatMessage {
     #[serde(default)]
     pub content: Option<MessageContent>,
 
+    /// Canonical chain-of-thought channel, populated by the provider or the
+    /// reasoning-normalization pipeline. Established by DeepSeek, adopted by
+    /// Kimi/GLM/MiniMax; mixer normalizes every other upstream dialect into
+    /// this field before emitting to the client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 
@@ -212,12 +219,15 @@ pub struct ChatChoice {
 /// clients via [`ChatResponse::from_chunks`].
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatCompletionChunk {
+    #[serde(default)]
     pub id: String,
     #[serde(default)]
     pub object: String,
     #[serde(default)]
     pub created: i64,
+    #[serde(default)]
     pub model: String,
+    #[serde(default)]
     pub choices: Vec<ChunkChoice>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -242,6 +252,13 @@ pub struct ChatDelta {
     pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Canonical chain-of-thought channel for streaming deltas. Providers
+    /// that natively use DeepSeek's `reasoning_content` surface it here via
+    /// serde; providers that emit other dialects (Qwen inline `<think>` tags,
+    /// OpenAI Responses-API reasoning-summary events) are rewritten into this
+    /// field by [`crate::reasoning`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Value>,
 
@@ -266,6 +283,8 @@ impl ChatResponse {
         let mut roles: std::collections::HashMap<u32, Option<String>> =
             std::collections::HashMap::new();
         let mut contents: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+        let mut reasonings: std::collections::HashMap<u32, String> =
+            std::collections::HashMap::new();
         let mut finishes: std::collections::HashMap<u32, Option<String>> =
             std::collections::HashMap::new();
         let mut tool_calls: std::collections::HashMap<u32, Vec<Value>> =
@@ -298,6 +317,9 @@ impl ChatResponse {
                 if let Some(text) = choice.delta.content {
                     contents.entry(choice.index).or_default().push_str(&text);
                 }
+                if let Some(text) = choice.delta.reasoning_content {
+                    reasonings.entry(choice.index).or_default().push_str(&text);
+                }
                 if let Some(tc) = choice.delta.tool_calls {
                     let entry = tool_calls.entry(choice.index).or_default();
                     merge_tool_call_deltas(entry, tc);
@@ -320,6 +342,7 @@ impl ChatResponse {
                     content: Some(MessageContent::Text(
                         contents.remove(&idx).unwrap_or_default(),
                     )),
+                    reasoning_content: reasonings.remove(&idx).filter(|s| !s.is_empty()),
                     name: None,
                     tool_calls: tool_calls
                         .remove(&idx)
@@ -649,14 +672,12 @@ mod tests {
             choices: vec![ChunkChoice {
                 index: 0,
                 delta: ChatDelta {
-                    role: None,
                     content: if content.is_empty() {
                         None
                     } else {
                         Some(content.to_string())
                     },
-                    tool_calls: None,
-                    extra: Default::default(),
+                    ..Default::default()
                 },
                 finish_reason: finish.map(|s| s.to_string()),
             }],
@@ -672,9 +693,7 @@ mod tests {
                 index: 0,
                 delta: ChatDelta {
                     role: Some("assistant".to_string()),
-                    content: None,
-                    tool_calls: None,
-                    extra: Default::default(),
+                    ..Default::default()
                 },
                 finish_reason: None,
             }],

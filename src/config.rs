@@ -37,6 +37,33 @@ pub struct Config {
     /// loopback-only behaviour).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_bearer_token_env: Option<String>,
+
+    /// How mixer renders reasoning/chain-of-thought to clients. Defaults to
+    /// `structured` — every upstream's chain-of-thought surfaces on the
+    /// canonical `delta.reasoning_content` field regardless of how the
+    /// provider speaks on the wire. Set `inline_tags` to render reasoning as
+    /// `<think>…</think>` inside `content` (for clients that only recognize
+    /// that convention), or `omit` to strip reasoning entirely.
+    #[serde(default)]
+    pub reasoning_output: ReasoningOutput,
+}
+
+/// How to render chain-of-thought on the response wire. See
+/// [`Config::reasoning_output`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningOutput {
+    /// Emit reasoning on the canonical `delta.reasoning_content` field
+    /// (DeepSeek convention; opencode and most modern clients render this).
+    #[default]
+    Structured,
+    /// Wrap reasoning in `<think>…</think>` inside `delta.content`. Useful for
+    /// older clients that predate `reasoning_content` or that treat tagged
+    /// content as thinking blocks.
+    InlineTags,
+    /// Drop reasoning from the outbound stream. The upstream still computes
+    /// it, but the client never sees it.
+    Omit,
 }
 
 /// A virtual mixer model — a pool of concrete provider/model backends plus
@@ -215,23 +242,26 @@ impl Default for Config {
                 backends: vec![
                     Backend {
                         provider: "codex".to_string(),
-                        model: "gpt-5.2".to_string(),
+                        model: "gpt-5.4".to_string(),
                     },
                     Backend {
                         provider: "minimax".to_string(),
-                        model: "MiniMax-M2".to_string(),
+                        model: "MiniMax-M2.7".to_string(),
                     },
                     Backend {
                         provider: "glm".to_string(),
-                        model: "glm-4.6".to_string(),
+                        model: "glm-5.1".to_string(),
                     },
+                    // opencode's slot defaults to Qwen: no other provider
+                    // mixer ships with fronts a Qwen model, so routing
+                    // Qwen through opencode is the only path.
                     Backend {
                         provider: "opencode".to_string(),
-                        model: "anthropic/claude-sonnet-4-6".to_string(),
+                        model: "qwen3.6-plus".to_string(),
                     },
                     Backend {
                         provider: "kimi-code".to_string(),
-                        model: "kimi-k2.6".to_string(),
+                        model: "kimi-for-coding".to_string(),
                     },
                 ],
                 strategy: RoutingStrategy::Random,
@@ -272,6 +302,7 @@ impl Default for Config {
             models,
             providers,
             listen_bearer_token_env: None,
+            reasoning_output: ReasoningOutput::default(),
         }
     }
 }

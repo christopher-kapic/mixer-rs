@@ -34,12 +34,15 @@ use crate::auth::device_flow::{DeviceFlowConfig, run_device_flow};
 use crate::config::ProviderSettings;
 use crate::credentials::CredentialStore;
 use crate::openai::ChatRequest;
+use crate::providers::common::models_list::fetch_openai_models;
 use crate::providers::common::oauth_refresh::{
     AuthenticationError, EXPIRY_THRESHOLD_SECS, OauthFreshness, is_near_expiry, oauth_freshness,
     provider_refresh_lock,
 };
 use crate::providers::common::openai_client::{self, AuthScheme};
-use crate::providers::{AuthKind, ChatStream, ModelInfo, Provider};
+use crate::providers::{
+    AuthKind, ChatStream, ModelInfo, Provider, ReasoningFormat, RemoteModelEntry,
+};
 use crate::usage::UsageSnapshot;
 
 /// OAuth client id published by `kimi-cli` (`KIMI_CODE_CLIENT_ID` in
@@ -51,6 +54,14 @@ const DEVICE_AUTH_PATH: &str = "/api/oauth/device_authorization";
 const TOKEN_PATH: &str = "/api/oauth/token";
 const API_BASE: &str = "https://api.kimi.com/coding/v1";
 const CHAT_PATH: &str = "/chat/completions";
+const MODELS_PATH: &str = "/models";
+
+/// Kimi's coding endpoint sniffs `User-Agent` and returns
+/// `403 access_terminated_error` unless the header looks like one of their
+/// approved Coding Agent clients. Matches the format `kimi-cli` itself sends
+/// (`KimiCLI/<version>`, see `src/kimi_cli/constant.py::get_user_agent`).
+/// Bump when Kimi starts rejecting this specific version.
+const USER_AGENT: &str = "KimiCLI/1.37.0";
 
 pub struct KimiCodeProvider;
 
@@ -65,10 +76,14 @@ impl Provider for KimiCodeProvider {
     }
 
     fn models(&self) -> Vec<ModelInfo> {
+        // The Kimi Code subscription gateway advertises exactly one model id
+        // via its live `/v1/models` endpoint: `kimi-for-coding`. The gateway
+        // routes internally to whichever underlying K2 variant is current;
+        // the specific K2.x ids are only addressable via the Moonshot
+        // pay-per-token endpoint (see `kimi_api.rs`).
         vec![
-            ModelInfo::new("kimi-k2.6", "Kimi K2.6", false, 256_000),
-            ModelInfo::new("kimi-k2.5", "Kimi K2.5", false, 256_000),
-            ModelInfo::new("kimi-k2-thinking", "Kimi K2 Thinking", false, 256_000),
+            ModelInfo::new("kimi-for-coding", "Kimi for Coding", false, 256_000)
+                .with_reasoning(ReasoningFormat::Structured),
         ]
     }
 
@@ -150,6 +165,7 @@ impl Provider for KimiCodeProvider {
             &access_token,
             AuthScheme::Bearer,
             timeout,
+            Some(USER_AGENT),
             req.clone(),
         )
         .await
@@ -171,6 +187,7 @@ impl Provider for KimiCodeProvider {
                         &fresh,
                         AuthScheme::Bearer,
                         timeout,
+                        Some(USER_AGENT),
                         req,
                     )
                     .await
@@ -187,6 +204,35 @@ impl Provider for KimiCodeProvider {
         _settings: &ProviderSettings,
     ) -> Result<Option<UsageSnapshot>> {
         Ok(None)
+    }
+
+    async fn list_remote_models(
+        &self,
+        store: &CredentialStore,
+        settings: &ProviderSettings,
+    ) -> Result<Option<Vec<RemoteModelEntry>>> {
+        // Mirrors chat_completion: refresh the OAuth access token (if near
+        // expiry) before hitting the upstream. Unlike chat, the models
+        // endpoint is idempotent, so a 401 here is conclusive — we surface
+        // it rather than retrying.
+        let refresh_client = build_kimi_http_client(settings)?;
+        let base = settings.base_url.as_deref().unwrap_or(API_BASE);
+        let url = format!("{}{MODELS_PATH}", base.trim_end_matches('/'));
+        let token_url = token_endpoint(settings);
+        let now = Utc::now().timestamp();
+        let timeout = settings.request_timeout_secs.map(Duration::from_secs);
+
+        let access_token = ensure_fresh_kimi_token(store, &refresh_client, &token_url, now).await?;
+        let entries = fetch_openai_models(
+            self.id(),
+            &url,
+            &access_token,
+            AuthScheme::Bearer,
+            timeout,
+            Some(USER_AGENT),
+        )
+        .await?;
+        Ok(Some(entries))
     }
 }
 
@@ -889,6 +935,119 @@ mod tests {
         assert_eq!(mock.chat_calls.load(Ordering::SeqCst), 2);
         assert_eq!(mock.refresh_calls.load(Ordering::SeqCst), 1);
         assert!(result.is_err());
+    }
+
+    // ── list_remote_models ──────────────────────────────────────────────────
+
+    /// Proves the OAuth refresh path fires before the models call, and that
+    /// the refreshed bearer — not the stored stale token — is sent to the
+    /// upstream /v1/models endpoint.
+    #[tokio::test]
+    async fn list_remote_models_refreshes_near_expiry_then_queries_upstream() {
+        use axum::{
+            Form, Router,
+            body::Body,
+            extract::State,
+            http::HeaderMap,
+            response::Response,
+            routing::{get, post},
+        };
+        use tokio::net::TcpListener;
+
+        let tmp = TempDir::new().unwrap();
+        let store = store_in(&tmp);
+        let near = Utc::now().timestamp() + 30;
+        write_creds_with_expiry(&store, near);
+
+        struct State0 {
+            refresh_calls: AtomicUsize,
+            models_calls: AtomicUsize,
+            models_auth: StdMutex<Option<String>>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct RefreshForm {
+            grant_type: String,
+        }
+
+        async fn refresh_handler(
+            State(s): State<Arc<State0>>,
+            Form(form): Form<RefreshForm>,
+        ) -> Response {
+            s.refresh_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(form.grant_type, "refresh_token");
+            let body = json!({
+                "access_token": "refreshed-for-models",
+                "refresh_token": "new-rt",
+                "token_type": "Bearer",
+                "expires_in": 3600u64,
+            })
+            .to_string();
+            Response::builder()
+                .status(200)
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        }
+
+        async fn models_handler(State(s): State<Arc<State0>>, headers: HeaderMap) -> Response {
+            s.models_calls.fetch_add(1, Ordering::SeqCst);
+            *s.models_auth.lock().unwrap() = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let body = json!({
+                "object": "list",
+                "data": [
+                    {"id": "kimi-k2.6"},
+                    {"id": "kimi-k2.5"},
+                    {"id": "kimi-k2-thinking"},
+                    {"id": "kimi-future"}
+                ]
+            })
+            .to_string();
+            Response::builder()
+                .status(200)
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        }
+
+        let state = Arc::new(State0 {
+            refresh_calls: AtomicUsize::new(0),
+            models_calls: AtomicUsize::new(0),
+            models_auth: StdMutex::new(None),
+        });
+        let app = Router::new()
+            .route(TOKEN_PATH, post(refresh_handler))
+            .route("/models", get(models_handler))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let settings = settings_for(addr);
+
+        let entries = KimiCodeProvider
+            .list_remote_models(&store, &settings)
+            .await
+            .expect("call succeeds")
+            .expect("kimi-code supports remote listing");
+
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].id, "kimi-k2.6");
+        assert_eq!(
+            state.refresh_calls.load(Ordering::SeqCst),
+            1,
+            "near-expiry token must be refreshed before the models call",
+        );
+        assert_eq!(state.models_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state.models_auth.lock().unwrap().as_deref(),
+            Some("Bearer refreshed-for-models"),
+            "models call must use the refreshed token, not the stored stale one",
+        );
     }
 
     // ── compute_expires_at ──────────────────────────────────────────────────

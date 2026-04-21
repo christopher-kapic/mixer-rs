@@ -5,8 +5,10 @@
 //! `/chat/completions`).
 //! Base URL: `https://opencode.ai/zen/v1` (override via
 //! `providers.opencode.base_url` in config).
-//! Auth: `x-api-key: <api_key>` (note: *not* the `Authorization: Bearer`
-//! scheme used by minimax and glm).
+//! Auth: `Authorization: Bearer <api_key>`. (Earlier releases of this provider
+//! sent `x-api-key`; the Zen gateway still accepts `x-api-key` on the
+//! `/models` endpoint but rejects it on `/chat/completions` with
+//! `"Missing API key."` — verified live on 2026-04-21.)
 //!
 //! Login stores the pasted API key at
 //! `~/.config/mixer/credentials/opencode.json` (0600). At dispatch time the
@@ -23,12 +25,11 @@ use crate::credentials::CredentialStore;
 use crate::openai::ChatRequest;
 use crate::providers::common::api_key_login::prompt_and_store_api_key;
 use crate::providers::common::openai_client::{self, AuthScheme};
-use crate::providers::{AuthKind, ChatStream, ModelInfo, Provider};
+use crate::providers::{AuthKind, ChatStream, ModelInfo, Provider, ReasoningFormat};
 use crate::usage::UsageSnapshot;
 
 const DEFAULT_BASE_URL: &str = "https://opencode.ai/zen/v1";
 const CHAT_PATH: &str = "/chat/completions";
-const AUTH_HEADER: &str = "x-api-key";
 
 pub struct OpencodeProvider;
 
@@ -43,14 +44,92 @@ impl Provider for OpencodeProvider {
     }
 
     fn models(&self) -> Vec<ModelInfo> {
+        // Sourced from https://opencode.ai/docs/zen — opencode Zen publishes
+        // model IDs as flat strings (no `<vendor>/` prefix). Older versions
+        // of this catalogue used `anthropic/<id>` / `openai/<id>`; those no
+        // longer match what the Zen gateway accepts.
+        //
+        // Qwen entries intentionally lead: no other provider mixer ships
+        // with fronts a Qwen model, so opencode is the only route for users
+        // who want Qwen in their pool. `qwen3.6-plus` is the current newest.
+        //
+        // Only non-deprecated entries are listed (as of 2026-04-21); Qwen3
+        // Coder 480B, GLM 4.7/4.6 via Zen, Gemini 3 Pro, Kimi K2/K2 Thinking
+        // via Zen, and MiniMax M2.1 via Zen are all past their deprecation
+        // date per the Zen docs.
+        // Reasoning dialect assignments follow the upstream convention per
+        // model family: Qwen emits `<think>…</think>` inline in content, so
+        // the normalizer strips the tags client-side. Every other Zen-fronted
+        // model exposes reasoning via the structured `reasoning_content`
+        // field once Zen translates the upstream's native format.
         vec![
+            ModelInfo::new("qwen3.6-plus", "Qwen3.6 Plus (via opencode)", true, 128_000)
+                .with_reasoning(ReasoningFormat::InlineThinkTags),
+            ModelInfo::new("qwen3.5-plus", "Qwen3.5 Plus (via opencode)", true, 128_000)
+                .with_reasoning(ReasoningFormat::InlineThinkTags),
             ModelInfo::new(
-                "anthropic/claude-sonnet-4-6",
+                "claude-opus-4-7",
+                "Claude Opus 4.7 (via opencode)",
+                true,
+                1_000_000,
+            )
+            .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new(
+                "claude-sonnet-4-6",
                 "Claude Sonnet 4.6 (via opencode)",
                 true,
                 1_000_000,
-            ),
-            ModelInfo::new("openai/gpt-5.2", "GPT-5.2 (via opencode)", true, 400_000),
+            )
+            .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new(
+                "claude-haiku-4-5",
+                "Claude Haiku 4.5 (via opencode)",
+                true,
+                1_000_000,
+            )
+            .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new("gpt-5.4", "GPT-5.4 (via opencode)", true, 400_000)
+                .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new("gpt-5.4-mini", "GPT-5.4 Mini (via opencode)", true, 400_000)
+                .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new(
+                "gpt-5.3-codex",
+                "GPT-5.3 Codex (via opencode)",
+                true,
+                400_000,
+            )
+            .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new("gpt-5.2", "GPT-5.2 (via opencode)", true, 400_000)
+                .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new(
+                "gemini-3.1-pro",
+                "Gemini 3.1 Pro (via opencode)",
+                true,
+                1_000_000,
+            )
+            .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new(
+                "gemini-3-flash",
+                "Gemini 3 Flash (via opencode)",
+                true,
+                1_000_000,
+            )
+            .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new(
+                "minimax-m2.5",
+                "MiniMax M2.5 (via opencode)",
+                false,
+                192_000,
+            )
+            .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new("glm-5.1", "GLM 5.1 (via opencode)", false, 200_000)
+                .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new("glm-5", "GLM 5 (via opencode)", false, 200_000)
+                .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new("kimi-k2.6", "Kimi K2.6 (via opencode)", false, 256_000)
+                .with_reasoning(ReasoningFormat::Structured),
+            ModelInfo::new("kimi-k2.5", "Kimi K2.5 (via opencode)", false, 256_000)
+                .with_reasoning(ReasoningFormat::Structured),
         ]
     }
 
@@ -96,8 +175,9 @@ impl Provider for OpencodeProvider {
             self.id(),
             &url,
             &api_key,
-            AuthScheme::ApiKeyHeader(AUTH_HEADER),
+            AuthScheme::Bearer,
             timeout,
+            None,
             req,
         )
         .await
@@ -129,7 +209,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_completion_uses_x_api_key_header_not_bearer() {
+    async fn chat_completion_uses_bearer_auth() {
         let tmp = TempDir::new().unwrap();
         let store = store_in(&tmp);
         store
@@ -137,7 +217,7 @@ mod tests {
             .unwrap();
 
         let body = sse(&[
-            r#"{"id":"r","object":"chat.completion.chunk","created":1,"model":"anthropic/claude-sonnet-4-6","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}"#,
+            r#"{"id":"r","object":"chat.completion.chunk","created":1,"model":"claude-sonnet-4-6","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}"#,
             r#"[DONE]"#,
         ]);
         let mock = start_mock_chat(200, "text/event-stream", body).await;
@@ -148,10 +228,13 @@ mod tests {
             .unwrap();
         let _: Vec<_> = stream.collect().await;
 
-        assert_eq!(mock.captured.header("x-api-key").as_deref(), Some("sk-zen"),);
+        assert_eq!(
+            mock.captured.header("authorization").as_deref(),
+            Some("Bearer sk-zen"),
+        );
         assert!(
-            mock.captured.header("authorization").is_none(),
-            "opencode must not send Authorization: Bearer",
+            mock.captured.header("x-api-key").is_none(),
+            "opencode must not send x-api-key (rejected by the Zen /chat/completions endpoint)",
         );
     }
 

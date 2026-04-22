@@ -148,7 +148,7 @@ impl Provider for KimiCodeProvider {
         &self,
         store: &CredentialStore,
         settings: &ProviderSettings,
-        req: ChatRequest,
+        mut req: ChatRequest,
     ) -> Result<ChatStream> {
         let refresh_client = build_kimi_http_client(settings)?;
         let base = settings.base_url.as_deref().unwrap_or(API_BASE);
@@ -156,6 +156,8 @@ impl Provider for KimiCodeProvider {
         let token_url = token_endpoint(settings);
         let now = Utc::now().timestamp();
         let timeout = settings.request_timeout_secs.map(Duration::from_secs);
+
+        inject_omitted_reasoning_on_assistant_tool_calls(&mut req);
 
         let access_token = ensure_fresh_kimi_token(store, &refresh_client, &token_url, now).await?;
 
@@ -241,6 +243,30 @@ impl Provider for KimiCodeProvider {
 /// (5xx, network) stays as-is — refreshing the access token wouldn't help.
 fn is_retryable_auth_error(err: &anyhow::Error) -> bool {
     err.downcast_ref::<AuthenticationError>().is_some()
+}
+
+/// Kimi Code's coding gateway runs every request in "thinking" mode and
+/// rejects assistant tool-call messages that lack `reasoning_content` with
+/// `400 invalid_request_error` ("thinking is enabled but reasoning_content is
+/// missing in assistant tool call message at index N"). Mixer routes across
+/// heterogeneous backends, so a tool-call turn produced by a different
+/// provider — or by Kimi itself via a client that doesn't round-trip the
+/// field (e.g. opencode) — can flow back to Kimi without `reasoning_content`.
+/// The original thought is not recoverable here. Kimi appears to treat an empty
+/// string as missing, so use a short non-empty marker rather than fabricating a
+/// plausible-looking rationale.
+const OMITTED_REASONING_MARKER: &str = "reasoning omitted";
+
+fn inject_omitted_reasoning_on_assistant_tool_calls(req: &mut ChatRequest) {
+    for msg in req.messages.iter_mut() {
+        let missing_or_blank_reasoning = msg
+            .reasoning_content
+            .as_deref()
+            .is_none_or(|s| s.trim().is_empty());
+        if msg.role == "assistant" && msg.tool_calls.is_some() && missing_or_blank_reasoning {
+            msg.reasoning_content = Some(OMITTED_REASONING_MARKER.to_string());
+        }
+    }
 }
 
 fn token_endpoint(settings: &ProviderSettings) -> String {
@@ -558,6 +584,171 @@ mod tests {
             mock.captured.header("authorization").as_deref(),
             Some("Bearer live-access"),
         );
+    }
+
+    #[tokio::test]
+    async fn forwards_omitted_reasoning_on_assistant_tool_call_messages() {
+        // Regression: Kimi Code's coding gateway rejects assistant tool-call
+        // messages that lack `reasoning_content` with
+        // `400: "thinking is enabled but reasoning_content is missing in
+        // assistant tool call message at index N"`. Mixer must inject an
+        // non-empty `reasoning_content` on those messages before forwarding,
+        // regardless of whether the earlier turn was produced by a different
+        // provider in the pool or by a client that dropped the field on
+        // replay (e.g. opencode).
+        let tmp = TempDir::new().unwrap();
+        let store = store_in(&tmp);
+        write_live_creds(&store);
+
+        let body = sse(&[
+            r#"{"id":"r","object":"chat.completion.chunk","created":1,"model":"kimi-for-coding","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}"#,
+            r#"[DONE]"#,
+        ]);
+        let mock = start_mock_chat(200, "text/event-stream", body).await;
+        let settings = settings_with_base(&format!("http://{}", mock.addr));
+
+        // Transcript shape: [user, assistant(text), assistant(tool_call, no
+        // reasoning_content), tool, user].
+        let req: ChatRequest = serde_json::from_str(
+            r#"{
+                "model": "kimi-for-coding",
+                "messages": [
+                    {"role": "user", "content": "what's the weather?"},
+                    {"role": "assistant", "content": "let me check"},
+                    {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [
+                            {"id": "c1", "type": "function",
+                             "function": {"name": "get_weather", "arguments": "{}"}}
+                        ]
+                    },
+                    {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+                    {"role": "user", "content": "thanks"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let _ = KimiCodeProvider
+            .chat_completion(&store, &settings, req)
+            .await
+            .unwrap();
+
+        let forwarded: serde_json::Value = serde_json::from_str(&mock.captured.body()).unwrap();
+        let msgs = forwarded["messages"].as_array().unwrap();
+
+        // Index 2 is the assistant tool-call message: reasoning_content must
+        // be present and non-empty so Kimi's presence check passes.
+        assert_eq!(
+            msgs[2]["reasoning_content"], OMITTED_REASONING_MARKER,
+            "assistant tool-call message must carry reasoning_content",
+        );
+        // Messages that already had the field or don't need it must not be
+        // touched.
+        assert!(msgs[0].get("reasoning_content").is_none());
+        assert!(msgs[1].get("reasoning_content").is_none());
+        assert!(msgs[3].get("reasoning_content").is_none());
+        assert!(msgs[4].get("reasoning_content").is_none());
+    }
+
+    #[tokio::test]
+    async fn preserves_existing_reasoning_content_on_assistant_tool_calls() {
+        // If the client DOES round-trip reasoning_content, the sanitizer
+        // must leave it alone — overwriting a real thought with the omitted
+        // marker would destroy chain-of-thought the model actually needs.
+        let tmp = TempDir::new().unwrap();
+        let store = store_in(&tmp);
+        write_live_creds(&store);
+
+        let body = sse(&[
+            r#"{"id":"r","object":"chat.completion.chunk","created":1,"model":"kimi-for-coding","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}"#,
+            r#"[DONE]"#,
+        ]);
+        let mock = start_mock_chat(200, "text/event-stream", body).await;
+        let settings = settings_with_base(&format!("http://{}", mock.addr));
+
+        let req: ChatRequest = serde_json::from_str(
+            r#"{
+                "model": "kimi-for-coding",
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": null,
+                        "reasoning_content": "prior thought",
+                        "tool_calls": [
+                            {"id": "c1", "type": "function",
+                             "function": {"name": "f", "arguments": "{}"}}
+                        ]
+                    },
+                    {"role": "tool", "tool_call_id": "c1", "content": "ok"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let _ = KimiCodeProvider
+            .chat_completion(&store, &settings, req)
+            .await
+            .unwrap();
+
+        let forwarded: serde_json::Value = serde_json::from_str(&mock.captured.body()).unwrap();
+        assert_eq!(
+            forwarded["messages"][1]["reasoning_content"],
+            "prior thought",
+        );
+    }
+
+    #[test]
+    fn inject_omitted_reasoning_only_targets_assistant_tool_calls() {
+        let mut req: ChatRequest = serde_json::from_str(
+            r#"{
+                "model": "kimi-for-coding",
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "plain reply"},
+                    {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [
+                            {"id": "c", "type": "function",
+                             "function": {"name": "f", "arguments": "{}"}}
+                        ]
+                    },
+                    {
+                        "role": "assistant",
+                        "content": null,
+                        "reasoning_content": "",
+                        "tool_calls": [
+                            {"id": "blank", "type": "function",
+                             "function": {"name": "f", "arguments": "{}"}}
+                        ]
+                    },
+                    {"role": "tool", "tool_call_id": "c", "content": "result"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        inject_omitted_reasoning_on_assistant_tool_calls(&mut req);
+
+        assert!(req.messages[0].reasoning_content.is_none(), "user");
+        assert!(
+            req.messages[1].reasoning_content.is_none(),
+            "assistant without tool_calls",
+        );
+        assert_eq!(
+            req.messages[2].reasoning_content.as_deref(),
+            Some(OMITTED_REASONING_MARKER),
+            "assistant with tool_calls must be filled",
+        );
+        assert_eq!(
+            req.messages[3].reasoning_content.as_deref(),
+            Some(OMITTED_REASONING_MARKER),
+            "blank assistant tool-call reasoning must be replaced",
+        );
+        assert!(req.messages[4].reasoning_content.is_none(), "tool");
     }
 
     #[tokio::test]
